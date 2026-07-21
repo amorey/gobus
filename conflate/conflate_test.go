@@ -467,24 +467,35 @@ func TestChanDeliversInOrderAndClosesOnSenderClose(t *testing.T) {
 	h := New[int](func(_, next string) (string, bool) { return next, true })
 	rx := h.Receiver()
 	defer rx.Close()
+
+	// Step the feeder one iteration at a time. An unbuffered gate in the
+	// pre-lock hook means a send on it both releases the feeder and proves it
+	// had come back around to the top of its loop; without that, the feeder
+	// can wake between the two key-2 sends below and deliver them separately.
+	gate := make(chan struct{})
+	rx.forTestingFeederBeforeLock = func() { <-gate }
+
 	ch := rx.Chan()
 	assert.Equal(t, (<-chan gobus.Event[int, string])(rx.ch), rx.Chan(), "Chan should be memoized")
 
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, "a"))
+	gate <- struct{}{}
 	assert.Equal(t, gobus.Event[int, string]{Key: 1, Value: "a"}, <-ch)
 
-	// Coalescing still applies behind the feeder: the feeder is parked on
-	// notify with an empty queue, so both sends land in key 2's slot and only
-	// the merged value is delivered.
+	// Coalescing still applies behind the feeder. Let it park on notify with
+	// an empty queue; the first send wakes it, but it cannot pop until it has
+	// come back around through the gate, so both sends land in key 2's slot
+	// and only the merged value is delivered.
+	gate <- struct{}{}
 	waitParked(t, rx)
 	require.NoError(t, tx.Send(2, "b"))
 	require.NoError(t, tx.Send(2, "c"))
-	ev := <-ch
-	assert.Equal(t, 2, ev.Key)
-	assert.Contains(t, []string{"b", "c"}, ev.Value)
+	gate <- struct{}{}
+	assert.Equal(t, gobus.Event[int, string]{Key: 2, Value: "c"}, <-ch)
 
 	tx.Close()
+	gate <- struct{}{}
 	_, ok := <-ch
 	assert.False(t, ok, "feeder should close the channel after draining")
 	assert.Equal(t, 0, h.forTestingReceiverCount(), "drained feeder should deregister")
