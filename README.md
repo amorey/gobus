@@ -2,6 +2,8 @@
 
 *Gobus is a small library of common event bus architectures for Go*
 
+<img width="435" src="https://github.com/user-attachments/assets/b564ee83-8171-4063-8796-665695e60906" />
+
 [![Go Reference](https://pkg.go.dev/badge/github.com/amorey/gobus.svg)](https://pkg.go.dev/github.com/amorey/gobus)
 ![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)
 
