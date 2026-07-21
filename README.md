@@ -9,7 +9,7 @@
 
 ## Introduction
 
-This library is a collection of higher-level event bus architectures for Go. It's designed as a sister library to [`gochan`](https://github.com/amorey/gochan) which is a collection of lower-level channel architectures for Go. Unlike channels, event buses pass messages between senders and receivers based on keys and the interesting design decisions are about what happens when several values for the same key are in flight at once. Currently these are the event bus archictures included in this library:
+This library is a collection of common event bus architectures for Go. It's designed as a sister library to [`gochan`](https://github.com/amorey/gochan) which is a collection of lower-level channel architectures. Unlike keyless channels, event buses pass messages between senders and receivers based on keys and the interesting design decisions are about what happens when several values for the same key are in flight at once. Currently these are the event bus archictures included in this library:
 
 | Package    | Senders | Receivers | Semantics                                                                   |
 | ---------- | ------- | --------- | --------------------------------------------------------------------------- |
@@ -63,8 +63,6 @@ rx := hub.Receiver(hub.WithKeyFilter(func(k string) bool { return k == "db-0" })
 rx := hub.Receiver(hub.WithMerge(stricter))
 rx := hub.Receiver(hub.WithKeyFilter(wanted), hub.WithMerge(stricter))  // compose
 ```
-
-They hang off the hub rather than the package so that `K` and `V` are already fixed: call sites need no type arguments, and an option built for the wrong key type is a compile error. A package-level `conflate.WithKeyFilter(fn)` can infer neither parameter, forcing `conflate.WithKeyFilter[string, Update](fn)` at every call site. `New`, `WithKeyFilter` and `WithMerge` panic on a nil function — there is no implicit default policy.
 
 [Recv Example](./conflate/examples/recv/main.go) · [Chan Example](./conflate/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
