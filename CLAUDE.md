@@ -49,8 +49,19 @@ environment issue, not a code issue, and does not affect CI (Linux).
 
 ## Layout
 
+- `conformance_test.go` (root, `package gobus_test`) — the cross-architecture
+  suite. It drives handles through the shared interfaces, not concrete types,
+  and pins the close/cancel/value precedence the interface docs promise on
+  every bus type's behalf. A new bus package means a new row in
+  `architectures`; if it can't pass, the interface doc is wrong and has to
+  change with it. This is the only place a bus that resolves the ordering its
+  own way fails — per-package tests can't see it, since such a bus still looks
+  internally consistent.
 - `gobus.go` — common `Sender[K, V]` and `Receiver[K, V]` interfaces every
-  package's handles implement, plus `Event[K, V]`. There is intentionally no
+  package's handles implement, plus `Event[K, V]`. These doc comments are the
+  module-wide contract, not a summary of `conflate`: a change to public
+  close/cancel behavior updates `gobus.go`, `README.md` and the conformance
+  suite, not just the package. There is intentionally no
   shared `Hub` interface — each bus package exposes its own concrete
   `*Hub[K, V]` so callers can't accidentally substitute one architecture for
   another.
@@ -91,6 +102,43 @@ the live key set rather than write volume.
 parks on a per-receiver `notify` channel that `signalLocked` closes-and-replaces;
 `feed` is a per-receiver goroutine backing `Chan`. Both must stay consistent —
 a change to one usually needs the mirror change in the other.
+
+**Close/cancel precedence is one ordered run under `s.mu`.** `recvLoop`
+resolves **closed > cancelled > value**: receiver/hub closed, then
+sender-closed-and-drained (`txClosed && order.Len() == 0`, which is exactly
+when `popLocked` would fail), then the `ctx` check, then the pop. The
+cancellation check must stay *above* the pop — otherwise the only cancellation
+arm is the parked `<-ctxDone`, and a receiver looping on `RecvContext` against
+a fast publisher never observes its own shutdown. The terminal exits carry a
+tear-down obligation (`delete(s.receivers, rx)`) that has to happen under the
+lock that decided they were terminal, so don't hoist any of them into the
+lock-free probe. The parking select's arms are deliberately **empty** — every
+wake falls through to the loop top so that ordered run is the only place a
+verdict is produced; an arm that returned `ErrClosed`/`ctx.Err()` itself would
+let a close racing a cancellation resolve by select roulette and skip the
+terminal deregistration. `SendContext` is the send-side twin: closed >
+cancelled, both tests under one acquisition of `s.mu`, delegating the fan-out
+to `sendLocked` — so no bus state is read outside the lock and `txClosed` stays
+a plain `bool`. What is *not* done under `s.mu` on either side is calling into
+the caller's `context.Context`: `sendLocked` and `recvLoop` both take an
+already-obtained `Done` channel into the locked region and resolve `ctx.Err()`
+only after releasing, because a user-supplied context's methods are arbitrary
+code that may take application locks — inverting the lock order against any
+goroutine that enters the bus while holding them. `sendLocked` therefore
+*reports* cancellation (`cancelled bool`) rather than resolving it, and its
+locked region sits in a closure with a deferred unlock — the caller's `Merge`
+and key filter run under `s.mu`, and a panic out of either must still release
+it or a recovering caller finds the hub wedged. The `ctx` check being *under*
+`s.mu` rather than an entry-time snapshot is deliberate and pinned by
+`TestSendContextChecksCancellationAtTheLockNotAtEntry` (via
+`forTestingBeforeSendLock`): nothing is published on behalf of a context that
+expired while the send waited for the lock, which keeps every verdict in the
+package derived from state read at the decision point. Read it before
+"restoring" the pre-check — the entry-snapshot form still passes every other
+test. gochan makes `txClosed` an `atomic.Bool` because its
+`watch`/`broadcast` read it from a lock-free `TryRecv` fast path; conflate has
+no such path (its only lock-free pre-check is `rx.done`), so copying the atomic
+here would buy nothing and give one field two access disciplines.
 
 **Nil means default on a receiver's policy fields.** `keep == nil` accepts all
 keys; `merge == nil` falls back to the hub's shared merge (always non-nil, since
@@ -151,6 +199,15 @@ Mirror `gochan`'s conventions unless there's a reason not to.
   "deliver vs. closed" select. A test that has a reader waiting on the channel
   makes the choice random; use the feeder's exit hook to sequence the test
   instead. `TestChanFeederCloseWhileDelivering` is the worked example.
+  `recvLoop`'s parking select needs no such seam, and deliberately has none:
+  its arms are empty, so the wake cannot decide anything and there is no
+  outcome to sequence. To fuse two terminations there, hold `s.mu` while
+  arming both — the woken reader cannot pass `s.mu.Lock()` until you release
+  it, so both are visible whenever it derives its answer, regardless of
+  scheduling. `TestParkedCloseAndCancelResolveToClosed` is the worked example.
+  Arm the *context* first: signalling `notify` first lets the reader leave the
+  select before `ctxDone` exists, so the arm under test is never taken and the
+  test passes while covering nothing. Verify by mutation, not by green.
 - Assert whole `Event` values rather than key and value separately, so the
   pairing itself is pinned (`assertRecv`).
 - Test-only helpers live in `conflate/helpers_test.go` (`lenForTest`,

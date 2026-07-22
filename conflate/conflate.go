@@ -103,6 +103,23 @@ type shared[K comparable, V any] struct {
 	receivers map[*Receiver[K, V]]struct{}
 	txClosed  bool
 	hubClosed bool
+
+	// forTestingBeforeSendLock, if non-nil, runs after SendContext has taken
+	// ctx's Done channel and before it takes mu, so a test can land a
+	// cancellation in the window where the send is waiting for the lock. The
+	// send-side twin of forTestingBeforeRecvLock. nil in production.
+	//
+	// Unlike the receiver seams, this one is hub-wide and is read outside mu —
+	// it has to be, since the window it opens is the wait for mu itself. It is
+	// therefore safe to arm only while no SendContext is in flight: the
+	// receiver hooks get their synchronization from a Receiver's
+	// single-consumer ownership, but a Sender is shared, so arming this one
+	// alongside a concurrent send is an unsynchronized write against the read
+	// in SendContext. Sequence the test through the hook (it runs on the
+	// sending goroutine) rather than by writing the field from a second one.
+	// The same scope means every concurrent SendContext on the hub runs it, so
+	// a multi-sender test must discriminate inside the func, not by arming.
+	forTestingBeforeSendLock func()
 }
 
 // Hub is the construction handle for a conflate pipeline.
@@ -269,13 +286,41 @@ func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	_, err := s.sendLocked(nil, k, v)
+	return err
+}
+
+// sendLocked is the shared send core: the one place the send-side precedence
+// is evaluated and a value is fanned out. Caller holds s.mu, so both tests see
+// a single consistent view of txClosed rather than a pre-check that could go
+// stale before the fan-out.
+//
+// Send opts out of cancellation by passing a nil ctxDone — a nil channel is
+// never ready in a select, the same trick recvLoop takes from
+// context.Background's nil Done(), and what keeps the ordering in the shared
+// core instead of in one of its callers.
+//
+// It reports cancellation rather than resolving it: the caller turns a true
+// cancelled into ctx.Err() *after* releasing s.mu. A caller-supplied
+// context.Context is arbitrary code, and its Err may take application locks —
+// held under s.mu that is a lock-order inversion against any goroutine that
+// takes those locks before entering the bus. Reading the already-obtained
+// Done channel calls nothing. recvLoop's cancellation arm is the same shape.
+func (s *shared[K, V]) sendLocked(ctxDone <-chan struct{}, k K, v V) (cancelled bool, err error) {
+	// closed > cancelled: ErrClosed is the durable answer, so it outranks a
+	// ctx a retry could replace.
 	if s.txClosed {
-		return gobus.ErrClosed
+		return false, gobus.ErrClosed
+	}
+	select {
+	case <-ctxDone:
+		return true, nil
+	default:
 	}
 	for rx := range s.receivers {
 		rx.enqueueLocked(k, v)
 	}
-	return nil
+	return false, nil
 }
 
 // TrySend is equivalent to Send for conflate: Send never blocks, so there is
@@ -283,13 +328,56 @@ func (tx *Sender[K, V]) Send(k K, v V) error {
 // [gobus.Sender] interface.
 func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 
-// SendContext returns ctx.Err() if ctx is already cancelled; otherwise behaves
-// like Send. Send never blocks, so the context is only checked at entry.
+// SendContext behaves like Send, but reports a cancelled ctx instead of
+// publishing. Send never blocks, so ctx is consulted exactly once — there is
+// no parked state in which a cancellation could arrive — and never gates the
+// call on anything but the bus lock.
+//
+// That single check is made where the send is *resolved*, under s.mu, not on
+// entry. So a ctx that was live when SendContext was called but is cancelled
+// by the time this send reaches the front of the lock reports ctx.Err() and
+// publishes nothing. This is deliberate: a caller passing a context is asking
+// for the publish to be bounded by it, and the wait for s.mu is real work —
+// the caller's own Merge and key filters run under that lock. Enqueueing a
+// value on behalf of a context that has since expired, on the grounds that it
+// was live a moment earlier, is the weaker answer. It also keeps every
+// verdict in this package derived from state read at the decision point:
+// txClosed and rx.done are re-read under the lock for the same reason, and
+// recvLoop places its own cancellation check under s.mu rather than trusting
+// an entry-time snapshot.
+//
+// A cancellation racing this call may therefore land either side of the lock,
+// and the two outcomes — published, or ctx.Err() — are both correct
+// resolutions of that race; the caller cannot have been relying on which.
+//
+// Precedence is closed > cancelled: a closed sender reports [gobus.ErrClosed]
+// even for an already-cancelled ctx, since that is the durable answer and a
+// retry with a fresh context would only return it again. A cancelled ctx on a
+// live sender still reports ctx.Err().
+//
+// Only ctx's Done channel is consulted under the bus lock; ctx.Err() is called
+// after it is released, so a context implementation that locks cannot deadlock
+// against another goroutine's Send or Close. See sendLocked.
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	s := tx.s
+	ctxDone := ctx.Done()
+	if s.forTestingBeforeSendLock != nil {
+		s.forTestingBeforeSendLock()
 	}
-	return tx.Send(k, v)
+	// The locked section is a closure so the unlock is deferred, matching Send:
+	// sendLocked runs the caller's key filter and Merge, and a panic out of
+	// either must still release s.mu or a recovering caller would find the
+	// whole hub wedged. Resolving ctx.Err() needs to happen after the unlock,
+	// which is what rules out simply deferring it in the method body.
+	cancelled, err := func() (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.sendLocked(ctxDone, k, v)
+	}()
+	if cancelled {
+		return ctx.Err()
+	}
+	return err
 }
 
 // Close closes the sender. Receivers drain their pending values once before
@@ -348,6 +436,27 @@ func (rx *Receiver[K, V]) popLocked() (gobus.Event[K, V], bool) {
 	return gobus.Event[K, V]{Key: k, Value: v}, true
 }
 
+// drainedLocked reports the terminal condition shared by all three receive
+// paths: the sender is closed and this receiver's queue is empty, so nothing
+// can ever arrive again. It is the single definition of "this stream is over"
+// — recvLoop, TryRecv and feed each have their own body by design, but must
+// not each carry their own idea of when to stop. Caller holds s.mu.
+//
+// order.Len() == 0 is exactly when popLocked fails, so testing it before the
+// pop is equivalent to the post-pop form and lets the check be ordered above
+// the cancellation one. A closed sender with events still queued is *not*
+// terminal: it drains first, which is Sender.Close's soft-drain contract.
+func (rx *Receiver[K, V]) drainedLocked() bool {
+	return rx.s.txClosed && rx.order.Len() == 0
+}
+
+// deregisterLocked drops rx from the hub so a long-lived hub does not pin a
+// drained receiver. It rides with every terminal verdict, and with
+// [Receiver.Close]. Caller holds s.mu.
+func (rx *Receiver[K, V]) deregisterLocked() {
+	delete(rx.s.receivers, rx)
+}
+
 // signalLocked wakes this receiver's parked readers, if any. Caller holds s.mu.
 func (rx *Receiver[K, V]) signalLocked() {
 	if rx.waiters == 0 {
@@ -366,7 +475,21 @@ func (rx *Receiver[K, V]) Recv() (gobus.Event[K, V], error) {
 }
 
 // RecvContext blocks like Recv but returns ctx.Err() if ctx is cancelled
-// first.
+// first. Cancellation does not close this receiver.
+//
+// It implements the closed > cancelled > value precedence documented on
+// [gobus.Receiver] — including that a cancelled ctx never consumes the event
+// it declined, and that reaching ctx.Err() neither closes nor deregisters the
+// receiver. What is conflate-specific is the cost of ignoring the latter: an
+// abandoned handle keeps coalescing, so it holds one slot per live key for the
+// hub's lifetime. `defer rx.Close()` covers it, as it does for any abandoned
+// receiver.
+//
+// To consume what is left before closing, loop on [Receiver.TryRecv] until it
+// reports any error, then Close. The flush alone is not a substitute for the
+// Close: against a still-open sender it ends on ErrEmpty, which is not
+// terminal and does not deregister — only a drain that reaches ErrClosed does
+// that on its own.
 func (rx *Receiver[K, V]) RecvContext(ctx context.Context) (gobus.Event[K, V], error) {
 	return rx.recvLoop(ctx)
 }
@@ -374,7 +497,22 @@ func (rx *Receiver[K, V]) RecvContext(ctx context.Context) (gobus.Event[K, V], e
 // recvLoop is the shared blocking-recv implementation. Recv passes
 // context.Background() to opt out of cancellation — Background's Done()
 // returns nil, and a nil channel in a select arm is never selected, so the
-// cancellation arm is a no-op on that path.
+// cancellation arm is a no-op on that path and the loop-top cancellation
+// check falls straight through to its default.
+//
+// The whole closed > cancelled > value precedence is evaluated in one ordered
+// run under s.mu, rather than split between the lock-free probe and the locked
+// body. Two reasons. The terminal exit carries a tear-down obligation —
+// dropping this receiver from s.receivers — that has to happen under the same
+// lock that decided it was terminal. And the cancellation check must sit above
+// the pop, or the only cancellation arm would be the <-ctxDone below,
+// reachable only once parked — so a receiver looping on RecvContext against a
+// publisher fast enough to keep an event always pending would take the value
+// return every iteration and never observe its own shutdown signal.
+//
+// Waking consumes nothing here — the event stays in the receiver's slots until
+// it is popped — so a wake that races a cancellation re-derives the same
+// ordered answer on the next iteration rather than resolving at random.
 func (rx *Receiver[K, V]) recvLoop(ctx context.Context) (gobus.Event[K, V], error) {
 	var zero gobus.Event[K, V]
 	s := rx.s
@@ -406,27 +544,47 @@ func (rx *Receiver[K, V]) recvLoop(ctx context.Context) (gobus.Event[K, V], erro
 			s.mu.Unlock()
 			return zero, gobus.ErrClosed
 		}
+		// closed: nothing can arrive again.
+		if rx.drainedLocked() {
+			rx.deregisterLocked()
+			s.mu.Unlock()
+			return zero, gobus.ErrClosed
+		}
+		// cancelled: above the pop, so a pending event cannot starve it.
+		select {
+		case <-ctxDone:
+			s.mu.Unlock()
+			return zero, ctx.Err()
+		default:
+		}
+		// value: the oldest pending event.
 		if ev, ok := rx.popLocked(); ok {
 			s.mu.Unlock()
 			return ev, nil
-		}
-		if s.txClosed {
-			// Terminal: deregister so a long-lived hub doesn't pin a drained
-			// receiver after a Sender.Close soft close.
-			delete(s.receivers, rx)
-			s.mu.Unlock()
-			return zero, gobus.ErrClosed
 		}
 		rx.waiters++
 		parked = true
 		notify := rx.notify
 		s.mu.Unlock()
+		// Every arm falls through to the top of the loop rather than deciding
+		// the answer here. A wake carries no value and no verdict — it only
+		// says "state changed, look again" — so the ordered run above is the
+		// single place the precedence is evaluated, on the parked path as much
+		// as at entry. Returning ErrClosed / ctx.Err() directly from these arms
+		// would hand the decision to the select: with a close and a
+		// cancellation both landing on a parked receiver, both arms are ready,
+		// Go picks uniformly at random, and the documented closed > cancelled
+		// order would hold at entry but be a coin flip here — which would also
+		// skip the terminal deregistration on the ctx side. The extra lap is free: the
+		// acquisition it takes is the one the deferred waiters-- would have taken
+		// anyway.
+		//
+		// The feeder's mirror of this select needs no such change: it has no
+		// context, so its two arms cannot disagree about the verdict.
 		select {
 		case <-notify:
 		case <-rx.done.Done():
-			return zero, gobus.ErrClosed
 		case <-ctxDone:
-			return zero, ctx.Err()
 		}
 	}
 }
@@ -450,12 +608,12 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 	if rx.done.IsClosed() {
 		return zero, gobus.ErrClosed
 	}
+	if rx.drainedLocked() {
+		rx.deregisterLocked()
+		return zero, gobus.ErrClosed
+	}
 	if ev, ok := rx.popLocked(); ok {
 		return ev, nil
-	}
-	if rx.s.txClosed {
-		delete(rx.s.receivers, rx)
-		return zero, gobus.ErrClosed
 	}
 	return zero, gobus.ErrEmpty
 }
@@ -519,6 +677,11 @@ func (rx *Receiver[K, V]) feed() {
 			s.mu.Unlock()
 			return
 		}
+		if rx.drainedLocked() {
+			rx.deregisterLocked()
+			s.mu.Unlock()
+			return
+		}
 		if ev, ok := rx.popLocked(); ok {
 			s.mu.Unlock()
 			if rx.forTestingFeederParked != nil {
@@ -530,11 +693,6 @@ func (rx *Receiver[K, V]) feed() {
 				return
 			}
 			continue
-		}
-		if s.txClosed {
-			delete(s.receivers, rx)
-			s.mu.Unlock()
-			return
 		}
 		rx.waiters++
 		parked = true
@@ -558,6 +716,6 @@ func (rx *Receiver[K, V]) Close() {
 	// serializes through mu too.
 	rx.s.mu.Lock()
 	rx.done.Close()
-	delete(rx.s.receivers, rx)
+	rx.deregisterLocked()
 	rx.s.mu.Unlock()
 }

@@ -123,6 +123,24 @@ var ErrFull   = errors.New("gobus: bus full")
 
 There is no `ErrLagged` equivalent. A conflate receiver that falls behind doesn't lose values it can be told about — it collapses them, which is the contract rather than an error condition.
 
+#### Close / cancel precedence
+
+`ErrClosed` outranks context cancellation in `SendContext`: a closed sender returns `ErrClosed` even for an already-cancelled `ctx`, since `ErrClosed` is the durable answer and a retry with a fresh context would only return it anyway. A cancelled `ctx` on a live sender still returns `ctx.Err()`.
+
+`Send` never blocks, so `SendContext` consults `ctx` exactly once — there is no parked state for a cancellation to arrive in. That check happens where the send is *resolved*, under the bus lock, not on entry: a `ctx` that was live at the call but is cancelled by the time the send reaches the front of the lock returns `ctx.Err()` and publishes nothing. Waiting for that lock is real work — your `Merge` and key filters run under it — and a context is a bound on the publish actually happening, not on the function being entered. A cancellation racing the call can land either side of the lock; both outcomes are correct resolutions of that race.
+
+`RecvContext` uses the same precedence, one rank longer: **closed > cancelled > value**. `ErrClosed` wins whenever the receive is terminal — the receiver or the hub is closed, or the sender has closed and this receiver's queue is drained — so a shutdown loop that cancels its own context can still drain to `ErrClosed` rather than spinning on `ctx.Err()`. Otherwise a cancelled `ctx` returns `ctx.Err()` *even when an event is pending*, and that event stays queued rather than being consumed. This is what keeps cancellation observable under load: without it, a consumer looping on `RecvContext` against a publisher fast enough to keep something always pending would take the value every iteration and never notice its own shutdown signal.
+
+Because nothing is discarded, `ctx.Err()` is not an end-of-stream: with the sender closed and events still queued, every `RecvContext` on a cancelled `ctx` returns `ctx.Err()` and none of them reaches `ErrClosed`. Only draining to `ErrClosed` deregisters a receiver on its own, so a caller that stops on `ctx.Err()` must `Receiver.Close()` — otherwise the handle stays in the hub, still accumulating coalesced events, for the hub's lifetime. `defer rx.Close()` covers this. To consume what is left first, loop on `TryRecv` until it returns *any* error — `ErrEmpty` while the sender is open, `ErrClosed` once it has closed and the queue is drained.
+
+The precedence is not just an entry-time check — it governs the parked path identically. A conflate wake carries no value and no verdict: the event stays in the receiver's slots until it is popped, and the wakeup only means "state changed, look again", so a parked call re-derives the whole closed > cancelled > value answer from state before returning. Whatever a parked receiver is woken by, the answer is the one that ranking gives for the state visible when it resumes — a close visible then reports `ErrClosed` (and deregisters) even if the cancellation is what did the waking.
+
+What that cannot do is order two terminations the caller never ordered. If a close and a cancellation are issued from separate goroutines with no happens-before between them, whichever becomes visible first is the one the receive resolves against: a cancellation that lands while the close has not yet reached the bus lock returns `ctx.Err()`, exactly as it would if the caller had entered `RecvContext` a microsecond earlier or later. Both are terminal for that receive, so don't depend on which one you get.
+
+The non-determinism there is only about which event arrives first, never about how the answer is derived from what has arrived. Whenever both are visible at the point the receive resolves, `ErrClosed` wins — every time, not usually. A bus that resolved such a wake by picking a ready `select` arm would be wrong even though its outcomes look similar from the outside. Cancellation still never consumes an event, whichever way the race falls.
+
+Sender-close is the one termination that does not pre-empt a pending event: it is a graceful end-of-stream, so queued events drain first and `ErrClosed` follows only once nothing is left.
+
 ### Close semantics
 
 | Call               | Effect                                                                                                                                 |
