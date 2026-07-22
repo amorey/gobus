@@ -2,6 +2,7 @@ package conflate
 
 import (
 	"context"
+	"errors"
 	"runtime"
 	"sync"
 	"testing"
@@ -39,6 +40,15 @@ func assertEmpty[K comparable, V any](t *testing.T, rx *Receiver[K, V]) {
 // waitParked spins until the receiver has a reader parked in its blocking
 // select, so a subsequent Close/Send is guaranteed to land in-select rather
 // than being observed by one of the pre-park checks.
+//
+// waiters is incremented under s.mu just *before* the goroutine enters the
+// select, so a return here proves the reader is committed to parking, not that
+// it has already reached the select. That gap is harmless and cannot be closed
+// by polling harder: notify is captured under the same lock that raised the
+// count, so a close-and-replace landing in the gap is still observed by the
+// select the reader is about to enter. Tests that need more than "committed to
+// park" must gate on s.mu rather than on this — see
+// TestParkedCloseAndCancelResolveToClosed.
 func waitParked[K comparable, V any](t *testing.T, rx *Receiver[K, V]) {
 	t.Helper()
 	deadline := time.Now().Add(5 * time.Second)
@@ -54,6 +64,24 @@ func waitParked[K comparable, V any](t *testing.T, rx *Receiver[K, V]) {
 		}
 		runtime.Gosched()
 	}
+}
+
+// parkedRecv starts a RecvContext on rx in its own goroutine and returns once
+// that reader has parked, so the caller can fire a Send/Close/cancel at a
+// reader that is provably past the entry-time checks. The error channel is
+// buffered so the reader never blocks handing its result back.
+//
+// Pass context.Background() for the Recv (no cancellation) case: recvLoop
+// takes that path itself, so it is the same code under test.
+func parkedRecv[K comparable, V any](t *testing.T, rx *Receiver[K, V], ctx context.Context) <-chan error {
+	t.Helper()
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := rx.RecvContext(ctx)
+		errCh <- err
+	}()
+	waitParked(t, rx)
+	return errCh
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
@@ -139,12 +167,7 @@ func TestRecvWakesParkedReceiver(t *testing.T) {
 func TestCloseWakesParkedReceiver(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := rx.Recv()
-		errCh <- err
-	}()
-	waitParked(t, rx)
+	errCh := parkedRecv(t, rx, context.Background())
 	rx.Close()
 	assert.ErrorIs(t, <-errCh, gobus.ErrClosed)
 }
@@ -153,29 +176,218 @@ func TestRecvContextCancel(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := rx.RecvContext(ctx)
-		errCh <- err
-	}()
-	waitParked(t, rx)
+	errCh := parkedRecv(t, rx, ctx)
 	cancel()
 	assert.ErrorIs(t, <-errCh, context.Canceled)
 }
 
-func TestRecvContextAlreadyCancelled(t *testing.T) {
+// TestRecvContextCancelBeatsPendingValue pins the middle rank of recvLoop's
+// closed > cancelled > value precedence at entry time: a cancelled ctx wins
+// over an event that is already pending, and does not consume it. Without
+// this, a consumer looping on RecvContext against a publisher fast enough to
+// keep something always queued would never observe its own shutdown signal.
+func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	// A cancelled context does not prevent delivery of an already-pending
-	// event: the queue is checked before the loop ever parks.
 	require.NoError(t, h.Sender().Send(1, 1))
-	ev, err := rx.RecvContext(ctx)
-	require.NoError(t, err)
-	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 1}, ev)
-	_, err = rx.RecvContext(ctx)
-	assert.ErrorIs(t, err, context.Canceled)
+
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// The event was left queued, not consumed and discarded.
+	assertRecv(t, rx, 1, 1)
+}
+
+// TestRecvContextCancelBeatsValueDeliveredWhileParked covers the same
+// precedence on the parked path rather than the entry-time one. The receiver
+// is already blocked in the parking select when the event and the cancellation
+// both land, so the wake races between the <-notify and <-ctxDone arms. Either
+// way the next loop iteration re-derives the answer from state and must return
+// ctx.Err() with the event still queued: waking consumes nothing, and the
+// loop-top ctx check sits above the pop.
+func TestRecvContextCancelBeatsValueDeliveredWhileParked(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := parkedRecv(t, rx, ctx)
+
+	// Cancel from the pre-lock hook rather than before the Send, so the parked
+	// receiver is woken by <-notify with an event genuinely queued and only
+	// then observes the cancellation. Sending first and cancelling after would
+	// let <-ctxDone win the wake outright, and the value path — the one this
+	// test exists to cover — would never run.
+	rx.forTestingBeforeRecvLock = func() { cancel() }
+	require.NoError(t, h.Sender().Send(7, 42))
+
+	require.ErrorIs(t, <-errCh, context.Canceled)
+	rx.forTestingBeforeRecvLock = nil
+	assertRecv(t, rx, 7, 42) // not consumed by the cancelled parked receive
+}
+
+// TestParkedCloseAndCancelResolveToClosed covers the case the hook-driven
+// tests below structurally cannot: both parked arms ready at once, with the
+// select — not the precedence — free to pick either.
+//
+// Simultaneity comes from s.mu rather than from a hook, so the test depends
+// only on the invariant it is asserting (the answer is derived under the lock)
+// and not on where any test seam sits. A woken receiver cannot get past
+// s.mu.Lock() until this block ends, so both terminations are guaranteed
+// visible whenever it does derive its answer, however the scheduler ordered
+// the wake.
+//
+// Repeated because the failure it guards against is probabilistic: with the
+// arms deciding for themselves, Go's uniform select choice returns ctx.Err()
+// about half the time — and leaves the receiver registered when it does. One
+// iteration would be a coin flip; this many makes the old behavior a certain
+// failure.
+func TestParkedCloseAndCancelResolveToClosed(t *testing.T) {
+	const iters = 200
+	for i := 0; i < iters; i++ {
+		h := New[int](latestWins)
+		rx := h.Receiver()
+		ctx, cancel := context.WithCancel(context.Background())
+		errCh := parkedRecv(t, rx, ctx)
+
+		// Sender.Close can't be used here: it takes the lock this test is
+		// holding precisely to fuse the two events. Setting the flag and
+		// signalling under mu is exactly the state it would leave behind.
+		// Order matters: cancel first, so <-ctxDone is armed before anything
+		// can wake the receiver. Signalling first lets it leave the select on
+		// <-notify while ctxDone is still un-armed, and the arm that has to
+		// lose for this test to mean anything is never taken — a green test
+		// covering nothing, which arming in this order is what prevents.
+		s := rx.s
+		s.mu.Lock()
+		cancel()          // arms <-ctxDone: the arm that must not decide
+		s.txClosed = true // ...against a termination it cannot see yet
+		rx.signalLocked() // arms <-notify too, so either may win the wake
+		s.mu.Unlock()
+
+		require.ErrorIs(t, <-errCh, gobus.ErrClosed)
+		assert.Equal(t, 0, h.forTestingReceiverCount(), "terminal exit skipped deregistration")
+	}
+}
+
+// TestParkedCancelWakeStillLosesToClose pins that closed > cancelled holds on
+// the parked path too, not just at entry. The cancellation is what wakes the
+// parked receiver — it is the only ready arm, so no select roulette is
+// involved — but a close becomes visible before the woken call re-derives its
+// answer, and ErrClosed must win anyway, carrying the terminal deregistration
+// with it. Both ranks of "closed" are covered: the hard receiver-close and the
+// soft sender-close-with-nothing-to-drain.
+//
+// This is what forces the parking select's arms to fall through to the loop
+// top instead of returning their own verdict. An arm that returned ctx.Err()
+// directly would report cancellation here, and worse, would make the real race
+// — a close and a cancellation both landing on a parked receiver, so both arms
+// ready — resolve by coin flip, leaving the receiver registered half the time.
+// TestParkedCloseAndCancelResolveToClosed covers that both-ready case.
+func TestParkedCancelWakeStillLosesToClose(t *testing.T) {
+	tests := []struct {
+		name  string
+		close func(h *Hub[int, int], rx *Receiver[int, int])
+	}{
+		{"sender close", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Sender().Close() }},
+		{"receiver close", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			ctx, cancel := context.WithCancel(context.Background())
+			errCh := parkedRecv(t, rx, ctx)
+
+			// Runs on the woken iteration, after the wake and before s.mu — so
+			// the close is visible exactly when the precedence is evaluated.
+			// Assigning before cancel() gives the write a happens-before edge
+			// to the wake.
+			rx.forTestingBeforeRecvLock = func() { tt.close(h, rx) }
+			cancel()
+
+			require.ErrorIs(t, <-errCh, gobus.ErrClosed)
+			// Either close deregisters: the terminal exit does it for the
+			// sender path, Close itself for the receiver path.
+			assert.Equal(t, 0, h.forTestingReceiverCount(), "close left the receiver registered")
+		})
+	}
+}
+
+// TestRecvContextCancelDoesNotCloseReceiver pins the other half of that
+// contract: ctx.Err() is not an end-of-stream. A cancelled receive leaves the
+// receiver live and registered — it never drains to ErrClosed on its own — so
+// a caller that stops on ctx.Err() must Close the handle or leak it into the
+// hub for the hub's lifetime. Also pins the waiters accounting across the
+// cancelled exit: a parked reader that leaves via ctx must not leave the count
+// raised, or later Sends would signal a receiver nobody is waiting on.
+func TestRecvContextCancelDoesNotCloseReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	ctx, cancel := context.WithCancel(context.Background())
+	errCh := parkedRecv(t, rx, ctx)
+	cancel()
+	require.ErrorIs(t, <-errCh, context.Canceled)
+
+	rx.s.mu.Lock()
+	waiters := rx.waiters
+	rx.s.mu.Unlock()
+	assert.Equal(t, 0, waiters, "cancelled exit left a phantom waiter")
+	assert.Equal(t, 1, h.forTestingReceiverCount(), "cancellation deregistered a live receiver")
+
+	// Still fully usable on a fresh context.
+	require.NoError(t, h.Sender().Send(1, 1))
+	assertRecv(t, rx, 1, 1)
+}
+
+// TestRecvContextDrainedSenderCloseBeatsCancel covers the arm the two tests
+// above miss: the receiver is live — so the hard-termination check falls
+// through — and the ctx is cancelled, but the sender has closed with the queue
+// drained. That is as durably terminal as a closed handle, so it must report
+// ErrClosed rather than ctx.Err(): a shutdown loop that cancels its own
+// context still has to be able to drain to ErrClosed instead of spinning on
+// ctx.Err() forever.
+func TestRecvContextDrainedSenderCloseBeatsCancel(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	h.Sender().Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Equal(t, 0, h.forTestingReceiverCount()) // terminal exit deregisters
+}
+
+// TestRecvContextCancelBeatsUndrainedSenderClose is the boundary case: same
+// closed sender, but with an event still queued the receive is not terminal
+// yet, so the cancelled ctx wins and the event survives for a later drain.
+func TestRecvContextCancelBeatsUndrainedSenderClose(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 1))
+	tx.Close()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := rx.RecvContext(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+
+	// The cancelled exit is not terminal, so it does not deregister — even
+	// here, where the closed sender means nothing can ever be enqueued again.
+	// This is the one case the precedence change moved: before it, a cancelled
+	// consumer draining a closed sender reached ErrClosed and deregistered
+	// itself. Now the handle is retained (bounded: one registry entry plus the
+	// events already queued) until it is drained on a live context or Closed.
+	// Deregistering here instead would contradict the receiver staying usable
+	// on a fresh context — see TestRecvContextCancelDoesNotCloseReceiver.
+	assert.Equal(t, 1, h.forTestingReceiverCount())
+
+	assertRecv(t, rx, 1, 1)
+	_, err = rx.Recv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "drain to ErrClosed deregisters")
 }
 
 func TestCoalesceLatestWins(t *testing.T) {
@@ -370,12 +582,203 @@ func TestTrySendAndSendContext(t *testing.T) {
 	assertEmpty(t, rx) // the cancelled SendContext never enqueued
 }
 
+// lockProbeContext is an already-cancelled context that records, each time the
+// bus asks it a question, whether the bus lock was held at that moment. A
+// caller-supplied context is arbitrary code whose methods may take application
+// locks, so calling one under s.mu inverts the lock order against any
+// goroutine that enters the bus while holding those locks — a deadlock the
+// bus's own tests would never hit, because the standard contexts don't do it.
+//
+// TryLock is the observation rather than a real deadlock: it answers "is s.mu
+// held right now" on this goroutine, with no scheduling assumption and nothing
+// to time out.
+type lockProbeContext struct {
+	context.Context
+	mu           *sync.Mutex
+	lockedInDone bool
+	lockedInErr  bool
+}
+
+func (c *lockProbeContext) Done() <-chan struct{} {
+	c.lockedInDone = c.lockedInDone || c.busLocked()
+	return c.Context.Done()
+}
+
+func (c *lockProbeContext) Err() error {
+	c.lockedInErr = c.lockedInErr || c.busLocked()
+	return c.Context.Err()
+}
+
+func (c *lockProbeContext) busLocked() bool {
+	if c.mu.TryLock() {
+		c.mu.Unlock()
+		return false
+	}
+	return true
+}
+
+func TestContextIsNeverConsultedUnderTheBusLock(t *testing.T) {
+	h := New[int](latestWins)
+	tx := h.Sender()
+	rx := h.Receiver()
+	inner, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	t.Run("SendContext", func(t *testing.T) {
+		ctx := &lockProbeContext{Context: inner, mu: &h.s.mu}
+		assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
+		assert.False(t, ctx.lockedInDone, "Done() called under s.mu")
+		assert.False(t, ctx.lockedInErr, "Err() called under s.mu")
+	})
+
+	t.Run("RecvContext", func(t *testing.T) {
+		require.NoError(t, tx.Send(1, 10)) // a pending value the cancellation must outrank
+		ctx := &lockProbeContext{Context: inner, mu: &h.s.mu}
+		_, err := rx.RecvContext(ctx)
+		assert.ErrorIs(t, err, context.Canceled)
+		assert.False(t, ctx.lockedInDone, "Done() called under s.mu")
+		assert.False(t, ctx.lockedInErr, "Err() called under s.mu")
+	})
+}
+
+// TestPanickingCallbackReleasesTheBusLock pins that a panic out of the
+// caller's Merge — which runs under s.mu — leaves the hub usable rather than
+// wedged. Every send path must release the lock on the way out, so this is
+// table-driven over all three: an unlock that is deferred on one path and
+// explicit on another is exactly the asymmetry that regresses.
+func TestPanickingCallbackReleasesTheBusLock(t *testing.T) {
+	boom := errors.New("merge exploded")
+	sends := map[string]func(tx *Sender[int, int], k, v int) error{
+		"Send":        func(tx *Sender[int, int], k, v int) error { return tx.Send(k, v) },
+		"TrySend":     func(tx *Sender[int, int], k, v int) error { return tx.TrySend(k, v) },
+		"SendContext": func(tx *Sender[int, int], k, v int) error { return tx.SendContext(context.Background(), k, v) },
+	}
+	for name, send := range sends {
+		t.Run(name, func(t *testing.T) {
+			explode := true
+			h := New[int](func(prev, next int) (int, bool) {
+				if explode {
+					panic(boom)
+				}
+				return next, true
+			})
+			tx := h.Sender()
+			rx := h.Receiver()
+			require.NoError(t, send(tx, 1, 10)) // first touch: no Merge, no panic
+
+			func() {
+				defer func() { assert.Equal(t, boom, recover()) }()
+				_ = send(tx, 1, 20) // coalesce: Merge panics under s.mu
+				t.Fatal("send did not panic")
+			}()
+
+			// s.mu is free, so the hub still works. TryLock proves it directly;
+			// a wedged mutex would otherwise deadlock the assertions below.
+			require.True(t, h.s.mu.TryLock(), "s.mu still held after the panic")
+			h.s.mu.Unlock()
+			explode = false
+			require.NoError(t, send(tx, 1, 30))
+			assertRecv(t, rx, 1, 30)
+		})
+	}
+}
+
+// TestSendContextChecksCancellationAtTheLockNotAtEntry pins that SendContext
+// resolves ctx where the send is decided — under s.mu — rather than from a
+// snapshot taken on entry. The hook fires after ctx's Done channel has been
+// taken and before the lock is acquired, which is exactly the window a
+// contended send sits in while another send's Merge runs, so a cancellation
+// landing there must still be honoured.
+//
+// An entry-time snapshot would have been taken before the hook ran and would
+// publish the value regardless; that is the mutation this test exists to
+// catch. Precedence is unaffected — a closed sender still outranks the
+// cancellation, which the second half asserts.
+func TestSendContextChecksCancellationAtTheLockNotAtEntry(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.s.forTestingBeforeSendLock = func() { cancel() }
+	require.NoError(t, ctx.Err(), "ctx must be live when SendContext is entered")
+
+	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
+	assertEmpty(t, rx) // the value was not published on behalf of a dead ctx
+
+	// closed > cancelled still holds when the cancellation lands in that same
+	// window, rather than having arrived before the call. A second, still-live
+	// context is what makes that the case under test: reusing the one above
+	// would enter already cancelled, which is the plain entry-time precedence
+	// the conformance suite pins (closed_beats_cancelled).
+	//
+	// This is a matter of the assertion meaning what it says, not of catching a
+	// mutation the entry-time form misses — there is no such mutation. A ctx
+	// cancelled on entry is also cancelled in the window and under the lock, so
+	// every cancellation arm that fires here fires there too; the entry-time
+	// form is if anything the stronger probe of the precedence itself. What it
+	// is not is a probe of *this* window, which is what the function is about.
+	closedCtx, cancelClosed := context.WithCancel(context.Background())
+	defer cancelClosed()
+	h.s.forTestingBeforeSendLock = func() { cancelClosed() }
+	tx.Close()
+	require.NoError(t, closedCtx.Err(), "ctx must be live when SendContext is entered")
+
+	assert.ErrorIs(t, tx.SendContext(closedCtx, 2, 20), gobus.ErrClosed)
+}
+
 func TestTryRecvOnClosedReceiver(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
 	rx.Close()
 	_, err := rx.TryRecv()
 	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+func TestTryRecvFlushTerminatesOnAnyError(t *testing.T) {
+	for _, closeSender := range []bool{false, true} {
+		name := "sender open"
+		if closeSender {
+			name = "sender closed"
+		}
+		t.Run(name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			tx := h.Sender()
+			require.NoError(t, tx.Send(1, 11))
+			require.NoError(t, tx.Send(2, 22))
+			if closeSender {
+				tx.Close()
+			}
+			// Bounded so a non-terminating loop fails instead of hanging.
+			var err error
+			for i := 0; i < 100; i++ {
+				if _, err = rx.TryRecv(); err != nil {
+					break
+				}
+			}
+			require.Error(t, err, "flush loop never reached a terminal error")
+			if closeSender {
+				assert.ErrorIs(t, err, gobus.ErrClosed,
+					"a closed sender ends the flush with ErrClosed, never ErrEmpty")
+				// ErrClosed is terminal, so this flush deregisters on its own.
+				assert.Equal(t, 0, h.forTestingReceiverCount())
+			} else {
+				assert.ErrorIs(t, err, gobus.ErrEmpty)
+				// ErrEmpty is not terminal: the flush drained the queue but the
+				// handle is still registered and will keep accumulating from
+				// the live sender. Draining is not a substitute for Close —
+				// pinned here because the docs previously implied it was.
+				assert.Equal(t, 1, h.forTestingReceiverCount())
+				require.NoError(t, tx.Send(3, 33))
+				assert.Equal(t, 1, rx.lenForTest())
+
+				rx.Close() // the step the caller actually has to take
+				assert.Equal(t, 0, h.forTestingReceiverCount())
+			}
+		})
+	}
 }
 
 func TestTryRecvCloseRaceBeforeLock(t *testing.T) {
@@ -442,12 +845,7 @@ func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
 func TestSenderCloseWakesParkedReceiver(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
-	errCh := make(chan error, 1)
-	go func() {
-		_, err := rx.Recv()
-		errCh <- err
-	}()
-	waitParked(t, rx)
+	errCh := parkedRecv(t, rx, context.Background())
 	h.Sender().Close()
 	assert.ErrorIs(t, <-errCh, gobus.ErrClosed)
 }
@@ -461,6 +859,71 @@ func TestCloseRaceBeforeLock(t *testing.T) {
 	rx.forTestingBeforeRecvLock = func() { rx.Close() }
 	_, err := rx.Recv()
 	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// TestCloseBeatsValueDeliveredWhileParked is the close-side twin of
+// TestRecvContextCancelBeatsValueDeliveredWhileParked: receiver-close outranks
+// an event that lands at the same moment, on the parked path. Because a wake
+// here carries no value — the event stays in the receiver's slots until it is
+// popped — the next loop iteration re-derives the answer from state and
+// ErrClosed wins deterministically rather than by select roulette.
+func TestCloseBeatsValueDeliveredWhileParked(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	errCh := parkedRecv(t, rx, context.Background())
+
+	// Close from the pre-lock hook so the parked reader is woken by <-notify
+	// with an event genuinely queued, and only then observes the close.
+	// Closing before the Send would let <-rx.done win the wake outright and
+	// the value path this test exists to cover would never run.
+	rx.forTestingBeforeRecvLock = func() { rx.Close() }
+	require.NoError(t, h.Sender().Send(7, 42))
+
+	assert.ErrorIs(t, <-errCh, gobus.ErrClosed)
+}
+
+// TestRecvContextCancelRacingSendLosesNoEvent is the conservation property
+// behind the whole precedence, exercised as a real race rather than through a
+// hook: whatever order a Send and a cancel land in, a RecvContext either
+// returns the event or returns ctx.Err() with the event still queued. It must
+// never consume-and-discard, which is what would make a cancelled shutdown
+// silently drop the last update for a key.
+func TestRecvContextCancelRacingSendLosesNoEvent(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		h := New[int](latestWins)
+		rx := h.Receiver()
+		tx := h.Sender()
+
+		ctx, cancel := context.WithCancel(context.Background())
+		start := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var got gobus.Event[int, int]
+		var recvErr error
+		go func() {
+			defer wg.Done()
+			<-start
+			got, recvErr = rx.RecvContext(ctx)
+		}()
+		go func() {
+			defer wg.Done()
+			<-start
+			cancel()
+		}()
+		require.NoError(t, tx.Send(1, 99))
+		close(start)
+		wg.Wait()
+
+		if recvErr == nil {
+			require.Equal(t, gobus.Event[int, int]{Key: 1, Value: 99}, got)
+			assertEmpty(t, rx)
+		} else {
+			require.ErrorIs(t, recvErr, context.Canceled)
+			assertRecv(t, rx, 1, 99) // left queued, not discarded
+		}
+		rx.Close()
+	}
 }
 
 func TestChanDeliversInOrderAndClosesOnSenderClose(t *testing.T) {
