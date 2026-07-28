@@ -838,6 +838,62 @@ func TestPeekOnEmptyReceiver(t *testing.T) {
 	assert.Zero(t, ev, "the error return should carry a zero Event")
 }
 
+// TestPeekPrecedenceMatchesTryRecv pins that Peek is not a raw-state read: a
+// closed handle reports ErrClosed even with a value sitting at the head, which
+// is what keeps it from becoming a back door around the close precedence.
+func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		close func(h *Hub[int, int], rx *Receiver[int, int])
+	}{
+		{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
+		{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+			ev, err := rx.Peek()
+			assert.ErrorIs(t, err, gobus.ErrClosed, "a hard close outranks the queued value")
+			assert.Zero(t, ev)
+		})
+	}
+}
+
+func TestPeekDrainsThenReportsClosed(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	tx.Close()
+
+	// Sender.Close is the soft path, so the pending value is still peekable
+	// and still receivable.
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev)
+	assertRecv(t, rx, 1, 11)
+
+	// Drained and closed is terminal however it is observed, so the verdict
+	// carries the same deregistration TryRecv's does.
+	assert.Equal(t, 1, h.forTestingReceiverCount())
+	_, err = rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "the terminal Peek skipped deregistration")
+}
+
+func TestPeekCloseRaceBeforeLock(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 1))
+	// Close wins the race between the lock-free done pre-check and taking mu;
+	// the under-lock re-check must still return ErrClosed, not the head value.
+	rx.forTestingBeforePeekLock = func() { rx.Close() }
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

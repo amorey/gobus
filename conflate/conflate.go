@@ -149,12 +149,13 @@ type Receiver[K comparable, V any] struct {
 	chOnce sync.Once
 	ch     chan gobus.Event[K, V]
 
-	// forTestingBeforeRecvLock and forTestingBeforeTryRecvLock, if non-nil, run
-	// after the lock-free closed check and before taking s.mu, so tests can
-	// exercise the close-wins-the-race re-check under the lock. nil in
-	// production.
+	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock and
+	// forTestingBeforePeekLock, if non-nil, run after the lock-free closed
+	// check and before taking s.mu, so tests can exercise the
+	// close-wins-the-race re-check under the lock. nil in production.
 	forTestingBeforeRecvLock    func()
 	forTestingBeforeTryRecvLock func()
+	forTestingBeforePeekLock    func()
 
 	// forTestingFeederBeforeLock, forTestingFeederParked and
 	// forTestingFeederExit, if non-nil, are invoked by the Chan feeder:
@@ -636,11 +637,33 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 
 // Peek returns the oldest pending event without removing it, so a subsequent
 // Recv or TryRecv still returns it. It returns [gobus.ErrEmpty] if nothing is
-// pending.
+// pending, or [gobus.ErrClosed] if the receiver or hub is closed (or the sender
+// is closed and the pending values have drained) — the same precedence
+// [Receiver.TryRecv] applies. Peek is TryRecv without the pop, not a raw read
+// of the queue: a closed handle reports ErrClosed even with a value at the
+// head.
 func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], error) {
 	var zero gobus.Event[K, V]
+	if rx.done.IsClosed() {
+		return zero, gobus.ErrClosed
+	}
+	if rx.forTestingBeforePeekLock != nil {
+		rx.forTestingBeforePeekLock()
+	}
 	rx.s.mu.Lock()
 	defer rx.s.mu.Unlock()
+	// rx.done can flip between the lock-free check above and acquiring mu;
+	// Close holds mu before closing done, so a re-check here is race-free.
+	if rx.done.IsClosed() {
+		return zero, gobus.ErrClosed
+	}
+	// Drained-and-closed is terminal however it is observed, so this verdict
+	// carries the same tear-down the popping paths' does, under the lock that
+	// decided it.
+	if rx.drainedLocked() {
+		rx.deregisterLocked()
+		return zero, gobus.ErrClosed
+	}
 	if ev, ok := rx.peekLocked(); ok {
 		return ev, nil
 	}
