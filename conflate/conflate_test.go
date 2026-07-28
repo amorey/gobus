@@ -792,6 +792,233 @@ func TestTryRecvCloseRaceBeforeLock(t *testing.T) {
 	assert.ErrorIs(t, err, gobus.ErrClosed)
 }
 
+func TestPeekDoesNotConsume(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 11))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev)
+	assert.Equal(t, 1, rx.lenForTest(), "Peek consumed the event")
+
+	// The same event is still there for the consuming path, twice over: a
+	// second Peek, then the TryRecv that actually takes it.
+	again, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, ev, again)
+	got, err := rx.TryRecv()
+	require.NoError(t, err)
+	assert.Equal(t, ev, got, "TryRecv did not return the peeked event")
+	assert.Equal(t, 0, rx.lenForTest())
+}
+
+func TestPeekReportsTheHeadNotTheNewest(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev, "Peek should report first-touch order")
+
+	assertRecv(t, rx, 1, 11)
+	ev, err = rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 2, Value: 22}, ev, "the head should advance with the pop")
+}
+
+func TestPeekOnEmptyReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	ev, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+	assert.Zero(t, ev, "the error return should carry a zero Event")
+}
+
+// hardCloses are the two closes that abandon pending values, as opposed to
+// Sender.Close's soft drain. Shared by the tests that assert what Peek reports
+// once one of them has landed on a receiver with a value still queued.
+var hardCloses = []struct {
+	name  string
+	close func(h *Hub[int, int], rx *Receiver[int, int])
+}{
+	{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
+	{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
+}
+
+// TestPeekPrecedenceMatchesTryRecv pins that Peek is not a raw-state read: a
+// closed handle reports ErrClosed even with a value sitting at the head, which
+// is what keeps it from becoming a back door around the close precedence.
+func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+			ev, err := rx.Peek()
+			assert.ErrorIs(t, err, gobus.ErrClosed, "a hard close outranks the queued value")
+			assert.Zero(t, ev)
+		})
+	}
+}
+
+func TestPeekDrainsThenReportsClosed(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	tx.Close()
+
+	// Sender.Close is the soft path, so the pending value is still peekable
+	// and still receivable.
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev)
+	assertRecv(t, rx, 1, 11)
+
+	// Drained and closed is terminal however it is observed, so the verdict
+	// carries the same deregistration TryRecv's does.
+	assert.Equal(t, 1, h.forTestingReceiverCount())
+	_, err = rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "the terminal Peek skipped deregistration")
+}
+
+// TestPeekReflectsCoalescingWithoutMovingTheHead pins the half of the head-key
+// contract that holds: coalescing changes the head's value and leaves its
+// identity alone. A consumer folding an ordering quantity into V via Merge
+// reads it off this head, so the key must not jump on a re-send.
+func TestPeekReflectsCoalescingWithoutMovingTheHead(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, 99)) // coalesces into key 1's existing slot
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 99}, ev,
+		"the head key should be unchanged and carry the merged value")
+	assert.Equal(t, 2, rx.lenForTest(), "a coalesce should not grow the queue")
+}
+
+// TestPeekSeesAnnihilation pins the other half: annihilation *does* move the
+// head. The watermark that reads this head stays sound anyway, because the
+// replacement head was first touched later — its ordering quantity is higher,
+// so the cursor can only move conservatively.
+func TestPeekSeesAnnihilation(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, -1)) // negative annihilates key 1
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 2, Value: 22}, ev,
+		"an annihilated head should be gone, not reported empty or stale")
+	assert.Equal(t, 1, rx.lenForTest())
+}
+
+func TestPeekRespectsKeyFilter(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never the head
+	require.NoError(t, tx.Send(7, 77))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 7, Value: 77}, ev)
+}
+
+// TestPeekOnHardCloseWithQueuedKey is the observation a cursor-tracking
+// consumer has to respect: ErrClosed from Peek does *not* mean the backlog was
+// empty. Hub.Close and Receiver.Close abandon whatever is queued, so a consumer
+// that reads ErrClosed as "nothing pending" and commits its watermark to the
+// high end of the last batch silently skips these undelivered writes. Only
+// Sender.Close, the soft drain, empties the queue first.
+func TestPeekOnHardCloseWithQueuedKey(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+
+			_, err := rx.Peek()
+			require.ErrorIs(t, err, gobus.ErrClosed)
+			assert.Equal(t, 1, rx.lenForTest(),
+				"ErrClosed here coexists with a queued key, so it cannot be read as 'backlog empty'")
+		})
+	}
+}
+
+func TestPeekCloseRaceBeforeLock(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 1))
+	// Close wins the race between the lock-free done pre-check and taking mu;
+	// the under-lock re-check must still return ErrClosed, not the head value.
+	rx.forTestingBeforePeekLock = func() { rx.Close() }
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// TestPeekReportsEmptyWhileFeederHoldsEvent pins the documented-but-surprising
+// interaction with Chan: the feeder pops under s.mu and parks on delivery
+// outside it, so a Chan consumer can see an empty backlog while exactly one
+// event is in flight. Sequenced through the feeder's parked hook — the feeder
+// has popped and not yet delivered when it runs — rather than through the
+// channel, which would race the delivery.
+func TestPeekReportsEmptyWhileFeederHoldsEvent(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	defer rx.Close()
+	require.NoError(t, h.Sender().Send(1, 11))
+
+	popped := make(chan struct{})
+	release := make(chan struct{})
+	rx.forTestingFeederParked = func() {
+		close(popped)
+		<-release
+	}
+	ch := rx.Chan()
+
+	<-popped
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty,
+		"the in-flight event has left the queue, so Peek cannot see it")
+
+	close(release)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, <-ch, "the event is delivered, not lost")
+}
+
+// peekSink is a package-level sink for the allocation test. Assigning the
+// returned Event to a local would let the escape analysis of the test body,
+// rather than Peek itself, decide the result.
+var peekSink gobus.Event[int, int]
+
+func TestPeekAllocatesNothing(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	for k := 0; k < 64; k++ {
+		require.NoError(t, tx.Send(k, k))
+	}
+	// A list-head read plus one map lookup: nothing to allocate, and nothing
+	// that grows with the pending key count.
+	avg := testing.AllocsPerRun(100, func() { peekSink, _ = rx.Peek() })
+	assert.Zero(t, avg, "Peek should allocate nothing")
+	assert.Equal(t, gobus.Event[int, int]{Key: 0, Value: 0}, peekSink)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

@@ -53,6 +53,10 @@
 // the same producer disagree about what may be dropped, since one hub-wide
 // Merge cannot express that. The options compose.
 //
+// The backlog head is observable without consuming it. [Receiver.Peek]
+// returns the oldest pending event and leaves it in place, under the same
+// closed > value precedence the popping paths use.
+//
 // Sender close drains. [Sender.Close] lets each receiver drain its pending
 // values once before subsequent reads report [gobus.ErrClosed]. [Hub.Close]
 // is hard tear-down with no drain.
@@ -149,12 +153,13 @@ type Receiver[K comparable, V any] struct {
 	chOnce sync.Once
 	ch     chan gobus.Event[K, V]
 
-	// forTestingBeforeRecvLock and forTestingBeforeTryRecvLock, if non-nil, run
-	// after the lock-free closed check and before taking s.mu, so tests can
-	// exercise the close-wins-the-race re-check under the lock. nil in
-	// production.
+	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock and
+	// forTestingBeforePeekLock, if non-nil, run after the lock-free closed
+	// check and before taking s.mu, so tests can exercise the
+	// close-wins-the-race re-check under the lock. nil in production.
 	forTestingBeforeRecvLock    func()
 	forTestingBeforeTryRecvLock func()
+	forTestingBeforePeekLock    func()
 
 	// forTestingFeederBeforeLock, forTestingFeederParked and
 	// forTestingFeederExit, if non-nil, are invoked by the Chan feeder:
@@ -436,11 +441,27 @@ func (rx *Receiver[K, V]) popLocked() (gobus.Event[K, V], bool) {
 	return gobus.Event[K, V]{Key: k, Value: v}, true
 }
 
-// drainedLocked reports the terminal condition shared by all three receive
-// paths: the sender is closed and this receiver's queue is empty, so nothing
-// can ever arrive again. It is the single definition of "this stream is over"
-// — recvLoop, TryRecv and feed each have their own body by design, but must
-// not each carry their own idea of when to stop. Caller holds s.mu.
+// peekLocked returns the oldest pending event without removing it. Caller
+// holds s.mu.
+//
+// popLocked is deliberately not routed through this: it already holds the list
+// element it removes, so delegating would cost it a second elems lookup on the
+// pop path under s.mu to recover what it had. Four duplicated lines are the
+// cheaper trade.
+func (rx *Receiver[K, V]) peekLocked() (gobus.Event[K, V], bool) {
+	e := rx.order.Front()
+	if e == nil {
+		return gobus.Event[K, V]{}, false
+	}
+	k := e.Value.(K)
+	return gobus.Event[K, V]{Key: k, Value: rx.pending[k]}, true
+}
+
+// drainedLocked reports the terminal condition shared by every receive path:
+// the sender is closed and this receiver's queue is empty, so nothing can ever
+// arrive again. It is the single definition of "this stream is over" —
+// recvLoop, TryRecv, Peek and feed each have their own body by design, but
+// must not each carry their own idea of when to stop. Caller holds s.mu.
 //
 // order.Len() == 0 is exactly when popLocked fails, so testing it before the
 // pop is equivalent to the post-pop form and lets the check be ordered above
@@ -613,6 +634,59 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 		return zero, gobus.ErrClosed
 	}
 	if ev, ok := rx.popLocked(); ok {
+		return ev, nil
+	}
+	return zero, gobus.ErrEmpty
+}
+
+// Peek returns the oldest pending event without removing it, so a subsequent
+// Recv or TryRecv still returns it. It returns [gobus.ErrEmpty] if nothing is
+// pending, or [gobus.ErrClosed] if the receiver or hub is closed (or the sender
+// is closed and the pending values have drained) — the same precedence
+// [Receiver.TryRecv] applies. Peek is TryRecv without the pop, not a raw read
+// of the queue: a closed handle reports ErrClosed even with a value at the
+// head. Note that ErrClosed is therefore not a statement that the backlog was
+// empty: [Hub.Close] and [Receiver.Close] abandon whatever is still queued.
+//
+// The returned value is the current merged contents of the head key's slot. A
+// Send that coalesces into that slot between two Peeks changes what the second
+// Peek reports but leaves the key's queue position — and so its identity as the
+// head — unchanged. A Send whose [Merge] annihilates the head key removes it,
+// so the next Peek reports a different key: the head key is stable under
+// coalescing, not under annihilation.
+//
+// Peek takes the hub lock, the same one that serializes the whole Send
+// fan-out, so polling it in a loop slows every publisher and every other
+// receiver on the hub. Call it once per unit of work, not as a spin.
+//
+// Peek is safe to call from any goroutine, but like the rest of the receive
+// side it is only meaningful on the receiver's single consuming goroutine: a
+// concurrent Recv, TryRecv or [Receiver.Chan] feeder may take the peeked event
+// before the caller can act on it. An event already handed to the Chan feeder
+// has left the queue, so Peek reports ErrEmpty while it is in flight.
+func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], error) {
+	var zero gobus.Event[K, V]
+	if rx.done.IsClosed() {
+		return zero, gobus.ErrClosed
+	}
+	if rx.forTestingBeforePeekLock != nil {
+		rx.forTestingBeforePeekLock()
+	}
+	rx.s.mu.Lock()
+	defer rx.s.mu.Unlock()
+	// rx.done can flip between the lock-free check above and acquiring mu;
+	// Close holds mu before closing done, so a re-check here is race-free.
+	if rx.done.IsClosed() {
+		return zero, gobus.ErrClosed
+	}
+	// Drained-and-closed is terminal however it is observed, so this verdict
+	// carries the same tear-down the popping paths' does, under the lock that
+	// decided it.
+	if rx.drainedLocked() {
+		rx.deregisterLocked()
+		return zero, gobus.ErrClosed
+	}
+	if ev, ok := rx.peekLocked(); ok {
 		return ev, nil
 	}
 	return zero, gobus.ErrEmpty

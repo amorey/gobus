@@ -64,6 +64,20 @@ rx := hub.Receiver(hub.WithMerge(stricter))
 rx := hub.Receiver(hub.WithKeyFilter(wanted), hub.WithMerge(stricter))  // compose
 ```
 
+#### Inspecting the backlog head
+
+`Peek()` returns the oldest pending event without removing it — `TryRecv` minus the pop, sharing its precedence exactly: `ErrEmpty` when nothing is pending, `ErrClosed` when the receiver or hub is closed or the sender has closed and the queue has drained. It is not a raw read of the queue, so a closed handle reports `ErrClosed` even with a value at the head. The corollary matters if you track a cursor: `ErrClosed` is *not* a statement that the backlog was empty, because `Receiver.Close()` and `Hub.Close()` abandon whatever is still queued. Only `Sender.Close()` drains first.
+
+The value you get back is the current merged contents of the head key's slot, so it can change between two `Peek`s while the head *key* does not — coalescing leaves queue position alone. Annihilation is the exception: a `Merge` returning `keep == false` for the head key removes it, and the next `Peek` reports a different key.
+
+```go
+ev, err := rx.Peek()   // what would Recv hand me next, without taking it?
+```
+
+Two cautions. `Peek` takes the same hub lock that serializes the entire `Send` fan-out, so polling it in a loop degrades every publisher and every other receiver on the bus — call it once per unit of work. And while it is safe to call from any goroutine, it is only *meaningful* on the receiver's single consuming goroutine: anything else consuming concurrently can take the event you just looked at. An event already handed to the `Chan` feeder has left the queue, so `Peek` reports `ErrEmpty` while that one event is in flight.
+
+The intended use is a consumer that needs to know how far its backlog reaches — a resumable cursor or watermark. Fold the ordering quantity into `V` and let the bus's own `Merge` carry it: stamp each value at publication, keep the *earliest* stamp when two values for a key coalesce, and read it off the head. The bus makes no ordering claim of its own here, so the premise that publication order matches that quantity's order is yours to hold; if it doesn't, the head key's stamp is not the lowest one pending.
+
 [Recv Example](./conflate/examples/recv/main.go) · [Chan Example](./conflate/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
 ## Design notes
