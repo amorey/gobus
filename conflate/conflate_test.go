@@ -792,6 +792,52 @@ func TestTryRecvCloseRaceBeforeLock(t *testing.T) {
 	assert.ErrorIs(t, err, gobus.ErrClosed)
 }
 
+func TestPeekDoesNotConsume(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 11))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev)
+	assert.Equal(t, 1, rx.lenForTest(), "Peek consumed the event")
+
+	// The same event is still there for the consuming path, twice over: a
+	// second Peek, then the TryRecv that actually takes it.
+	again, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, ev, again)
+	got, err := rx.TryRecv()
+	require.NoError(t, err)
+	assert.Equal(t, ev, got, "TryRecv did not return the peeked event")
+	assert.Equal(t, 0, rx.lenForTest())
+}
+
+func TestPeekReportsTheHeadNotTheNewest(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, ev, "Peek should report first-touch order")
+
+	assertRecv(t, rx, 1, 11)
+	ev, err = rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 2, Value: 22}, ev, "the head should advance with the pop")
+}
+
+func TestPeekOnEmptyReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	ev, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+	assert.Zero(t, ev, "the error return should carry a zero Event")
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

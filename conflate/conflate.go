@@ -436,6 +436,22 @@ func (rx *Receiver[K, V]) popLocked() (gobus.Event[K, V], bool) {
 	return gobus.Event[K, V]{Key: k, Value: v}, true
 }
 
+// peekLocked returns the oldest pending event without removing it. Caller
+// holds s.mu.
+//
+// popLocked is deliberately not routed through this: it already holds the list
+// element it removes, so delegating would cost it a second elems lookup on the
+// pop path under s.mu to recover what it had. Four duplicated lines are the
+// cheaper trade.
+func (rx *Receiver[K, V]) peekLocked() (gobus.Event[K, V], bool) {
+	e := rx.order.Front()
+	if e == nil {
+		return gobus.Event[K, V]{}, false
+	}
+	k := e.Value.(K)
+	return gobus.Event[K, V]{Key: k, Value: rx.pending[k]}, true
+}
+
 // drainedLocked reports the terminal condition shared by all three receive
 // paths: the sender is closed and this receiver's queue is empty, so nothing
 // can ever arrive again. It is the single definition of "this stream is over"
@@ -613,6 +629,19 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 		return zero, gobus.ErrClosed
 	}
 	if ev, ok := rx.popLocked(); ok {
+		return ev, nil
+	}
+	return zero, gobus.ErrEmpty
+}
+
+// Peek returns the oldest pending event without removing it, so a subsequent
+// Recv or TryRecv still returns it. It returns [gobus.ErrEmpty] if nothing is
+// pending.
+func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], error) {
+	var zero gobus.Event[K, V]
+	rx.s.mu.Lock()
+	defer rx.s.mu.Unlock()
+	if ev, ok := rx.peekLocked(); ok {
 		return ev, nil
 	}
 	return zero, gobus.ErrEmpty
