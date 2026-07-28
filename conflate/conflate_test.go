@@ -838,17 +838,22 @@ func TestPeekOnEmptyReceiver(t *testing.T) {
 	assert.Zero(t, ev, "the error return should carry a zero Event")
 }
 
+// hardCloses are the two closes that abandon pending values, as opposed to
+// Sender.Close's soft drain. Shared by the tests that assert what Peek reports
+// once one of them has landed on a receiver with a value still queued.
+var hardCloses = []struct {
+	name  string
+	close func(h *Hub[int, int], rx *Receiver[int, int])
+}{
+	{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
+	{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
+}
+
 // TestPeekPrecedenceMatchesTryRecv pins that Peek is not a raw-state read: a
 // closed handle reports ErrClosed even with a value sitting at the head, which
 // is what keeps it from becoming a back door around the close precedence.
 func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		close func(h *Hub[int, int], rx *Receiver[int, int])
-	}{
-		{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
-		{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
-	} {
+	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
 			h := New[int](latestWins)
 			rx := h.Receiver()
@@ -940,13 +945,7 @@ func TestPeekRespectsKeyFilter(t *testing.T) {
 // high end of the last batch silently skips these undelivered writes. Only
 // Sender.Close, the soft drain, empties the queue first.
 func TestPeekOnHardCloseWithQueuedKey(t *testing.T) {
-	for _, tt := range []struct {
-		name  string
-		close func(h *Hub[int, int], rx *Receiver[int, int])
-	}{
-		{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
-		{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
-	} {
+	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
 			h := New[int](latestWins)
 			rx := h.Receiver()
