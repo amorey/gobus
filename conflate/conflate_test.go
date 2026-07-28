@@ -972,6 +972,54 @@ func TestPeekCloseRaceBeforeLock(t *testing.T) {
 	assert.ErrorIs(t, err, gobus.ErrClosed)
 }
 
+// TestPeekReportsEmptyWhileFeederHoldsEvent pins the documented-but-surprising
+// interaction with Chan: the feeder pops under s.mu and parks on delivery
+// outside it, so a Chan consumer can see an empty backlog while exactly one
+// event is in flight. Sequenced through the feeder's parked hook — the feeder
+// has popped and not yet delivered when it runs — rather than through the
+// channel, which would race the delivery.
+func TestPeekReportsEmptyWhileFeederHoldsEvent(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	defer rx.Close()
+	require.NoError(t, h.Sender().Send(1, 11))
+
+	popped := make(chan struct{})
+	release := make(chan struct{})
+	rx.forTestingFeederParked = func() {
+		close(popped)
+		<-release
+	}
+	ch := rx.Chan()
+
+	<-popped
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty,
+		"the in-flight event has left the queue, so Peek cannot see it")
+
+	close(release)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, <-ch, "the event is delivered, not lost")
+}
+
+// peekSink is a package-level sink for the allocation test. Assigning the
+// returned Event to a local would let the escape analysis of the test body,
+// rather than Peek itself, decide the result.
+var peekSink gobus.Event[int, int]
+
+func TestPeekAllocatesNothing(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	for k := 0; k < 64; k++ {
+		require.NoError(t, tx.Send(k, k))
+	}
+	// A list-head read plus one map lookup: nothing to allocate, and nothing
+	// that grows with the pending key count.
+	avg := testing.AllocsPerRun(100, func() { peekSink, _ = rx.Peek() })
+	assert.Zero(t, avg, "Peek should allocate nothing")
+	assert.Equal(t, gobus.Event[int, int]{Key: 0, Value: 0}, peekSink)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
