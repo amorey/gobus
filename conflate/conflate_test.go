@@ -883,6 +883,84 @@ func TestPeekDrainsThenReportsClosed(t *testing.T) {
 	assert.Equal(t, 0, h.forTestingReceiverCount(), "the terminal Peek skipped deregistration")
 }
 
+// TestPeekReflectsCoalescingWithoutMovingTheHead pins the half of the head-key
+// contract that holds: coalescing changes the head's value and leaves its
+// identity alone. A consumer folding an ordering quantity into V via Merge
+// reads it off this head, so the key must not jump on a re-send.
+func TestPeekReflectsCoalescingWithoutMovingTheHead(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, 99)) // coalesces into key 1's existing slot
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 99}, ev,
+		"the head key should be unchanged and carry the merged value")
+	assert.Equal(t, 2, rx.lenForTest(), "a coalesce should not grow the queue")
+}
+
+// TestPeekSeesAnnihilation pins the other half: annihilation *does* move the
+// head. The watermark that reads this head stays sound anyway, because the
+// replacement head was first touched later — its ordering quantity is higher,
+// so the cursor can only move conservatively.
+func TestPeekSeesAnnihilation(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, -1)) // negative annihilates key 1
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 2, Value: 22}, ev,
+		"an annihilated head should be gone, not reported empty or stale")
+	assert.Equal(t, 1, rx.lenForTest())
+}
+
+func TestPeekRespectsKeyFilter(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never the head
+	require.NoError(t, tx.Send(7, 77))
+
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, gobus.Event[int, int]{Key: 7, Value: 77}, ev)
+}
+
+// TestPeekOnHardCloseWithQueuedKey is the observation a cursor-tracking
+// consumer has to respect: ErrClosed from Peek does *not* mean the backlog was
+// empty. Hub.Close and Receiver.Close abandon whatever is queued, so a consumer
+// that reads ErrClosed as "nothing pending" and commits its watermark to the
+// high end of the last batch silently skips these undelivered writes. Only
+// Sender.Close, the soft drain, empties the queue first.
+func TestPeekOnHardCloseWithQueuedKey(t *testing.T) {
+	for _, tt := range []struct {
+		name  string
+		close func(h *Hub[int, int], rx *Receiver[int, int])
+	}{
+		{"receiver", func(_ *Hub[int, int], rx *Receiver[int, int]) { rx.Close() }},
+		{"hub", func(h *Hub[int, int], _ *Receiver[int, int]) { h.Close() }},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+
+			_, err := rx.Peek()
+			require.ErrorIs(t, err, gobus.ErrClosed)
+			assert.Equal(t, 1, rx.lenForTest(),
+				"ErrClosed here coexists with a queued key, so it cannot be read as 'backlog empty'")
+		})
+	}
+}
+
 func TestPeekCloseRaceBeforeLock(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
