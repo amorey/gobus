@@ -123,10 +123,12 @@ type shared[K comparable, V any] struct {
 	// and decremented — a derived value cannot drift below the truth.
 	liveReceivers atomic.Int64
 
-	// forTestingBeforeSendLock, if non-nil, runs after SendContext has taken
-	// ctx's Done channel and before it takes mu, so a test can land a
-	// cancellation in the window where the send is waiting for the lock. The
-	// send-side twin of forTestingBeforeRecvLock. nil in production.
+	// forTestingBeforeSendLock, if non-nil, runs on every send path that is about
+	// to take mu — Send, TrySend and SendContext — after SendContext has taken
+	// ctx's Done channel and before the lock is acquired. A test can therefore
+	// land a cancellation in the window where the send is waiting for the lock,
+	// and can count lock acquisitions from the send side. The send-side twin of
+	// forTestingBeforeRecvLock. nil in production.
 	//
 	// Unlike the receiver seams, this one is hub-wide and is read outside mu —
 	// it has to be, since the window it opens is the wait for mu itself. It is
@@ -311,6 +313,9 @@ func (h *Hub[K, V]) Close() {
 // otherwise k is appended at the back of the receiver's queue.
 func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
+	if s.forTestingBeforeSendLock != nil {
+		s.forTestingBeforeSendLock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.sendLocked(nil, k, v)

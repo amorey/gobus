@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1330,4 +1331,38 @@ func TestLiveCountTracksTheReceiverSet(t *testing.T) {
 	_, err := rx2.Recv()
 	require.ErrorIs(t, err, gobus.ErrClosed)
 	assert.Equal(t, 0, h.forTestingReceiverCount())
+}
+
+// countSendLocks arms the hub-wide send seam with a lock counter and returns
+// it. The seam runs only on the path that takes s.mu, so a zero count is proof
+// that a send skipped the lock — no timing and no second field.
+//
+// The counter is atomic because the seam runs on the *sending* goroutine. Every
+// caller below is single-goroutine, where a plain int would do, but a later
+// edit that adds a publisher must not turn this into a silent data race. Arming
+// itself is still only safe while no send is in flight: the field is hub-wide
+// and is read outside s.mu.
+func countSendLocks[K comparable, V any](h *Hub[K, V]) *atomic.Int64 {
+	var locks atomic.Int64
+	h.s.forTestingBeforeSendLock = func() { locks.Add(1) }
+	return &locks
+}
+
+// TestSendTakesTheBusLockWithAReceiver pins that the send seam reports the
+// locked path from Send, and not only from SendContext. Without this, the
+// no-receiver assertions below would be vacuous: a lock counter that Send never
+// increments reads zero whether or not a fast path exists.
+func TestSendTakesTheBusLockWithAReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	rx := h.Receiver()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.TrySend(2, 20))
+	require.NoError(t, tx.SendContext(context.Background(), 3, 30))
+
+	assert.Equal(t, int64(3), locks.Load())
+	assertRecv(t, rx, 1, 10)
 }
