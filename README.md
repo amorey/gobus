@@ -132,6 +132,20 @@ Three things distinguish it from `conflate`:
 
 `Send` for a key nobody watches is dropped, and nothing is retained: there is no receiver and therefore no buffer. `Send` on a hub with no receiver at all returns `nil` without taking the bus lock, exactly as `conflate` does.
 
+#### Inspecting what is unread
+
+`Peek()` returns the value a receive would hand back and leaves it unread — `TryRecv` minus the take, sharing its precedence exactly: `ErrEmpty` when nothing has superseded what this receiver has already seen, `ErrClosed` when the receiver or hub is closed or the sender has closed and the final value has been taken.
+
+```go
+ev, err := rx.Peek()   // what would Recv hand me next, without taking it?
+```
+
+It reports what is **unread**, not the key's current state. A caught-up receiver gets `ErrEmpty` even though its slot holds a perfectly good value, and a closed handle gets `ErrClosed` even with a value waiting. If you want the current state on demand, keep your own copy of the last value read — the reading goroutine already has it, and it costs no lock.
+
+Between two `Peek`s the key is fixed, since a receiver watches one key for life, but the value is not: a `Send` your `Accept` takes replaces the slot, so the second `Peek` reports the newer value and the older one is never handed back by either path. That is the same skip-ahead every read on this bus is subject to, only visible without consuming.
+
+Two cautions, as on `conflate`. `Peek` takes the same hub lock that serializes the entire `Send` fan-out, so polling it in a loop degrades every publisher and every other receiver on the bus — call it once per unit of work. And while it is safe to call from any goroutine, it is only *meaningful* on the receiver's single consuming goroutine. Unlike `conflate`'s `Peek`, a value already handed to the `Chan` feeder is still visible: the feeder marks it read only once the consumer has taken it.
+
 [Recv Example](./watch/examples/recv/main.go) · [Chan Example](./watch/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/watch)
 
 
@@ -167,6 +181,8 @@ type Receiver[K comparable, V any] interface {
 `Event` is deliberately the single currency of the receive side: `Recv`, `TryRecv`, `RecvContext` and `Chan` all hand back the same type, so a handler written as `func(gobus.Event[K, V])` works against any of them. Returning the key alongside the value also means `V` doesn't have to redundantly embed it.
 
 The send side stays unpacked — `Send(k, v)` rather than `Send(Event{...})` — because a publisher already has the key and value as separate values, and making it build a struct at every call site buys nothing.
+
+`Peek` is deliberately *not* on the interface, even though both bus types now have one. It is a concrete-`*Receiver` accessor on each, because what "unread" means is architectural: conflate peeks the head of a queue, `watch` peeks a versioned slot, and they answer differently for a value already handed to the `Chan` feeder — conflate's has left the queue, `watch`'s has not. An interface method would have to either state a truth one side violates or say so little that no architecture-agnostic call site could be written against it.
 
 As in `gochan`, there is intentionally no shared `Hub` interface — each multi-side package exposes its own concrete `*Hub[K, V]` so callers can't accidentally substitute one architecture for another. Every hub has the same shape:
 
