@@ -82,3 +82,50 @@ func New[K comparable, V any](opts ...Option[V]) *Hub[K, V] {
 // Sender returns the singleton send-side handle. Repeated calls return the
 // same handle. After the hub is closed it reports [gobus.ErrClosed] on use.
 func (h *Hub[K, V]) Sender() *Sender[K, V] { return h.tx }
+
+// Watch makes a receiver for k, seeded with initial as the value the caller
+// has just read. The receiver watches k for its whole life;
+// [Receiver.Close] is the unwatch.
+//
+// initial is the baseline, not a delivery: it is the prev of the first
+// [Accept] call, and it is never handed back through a receive. A receiver
+// reads a value only once a [Sender.Send] supersedes the baseline.
+//
+// Watch calls no caller code, so it is safe to call while holding the
+// producer's own lock — which is how a subscriber reads its state and
+// registers in one critical section, with no value lost in between. See
+// [Accept] for the rule an Accept must obey to keep that safe.
+//
+// If the hub is already closed the returned handle is pre-closed and reports
+// [gobus.ErrClosed] on use.
+func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
+	rx := &Receiver[K, V]{s: h.s, key: k, val: initial, notify: make(chan struct{})}
+	rx.done.Init()
+	h.s.mu.Lock()
+	if h.s.hubClosed {
+		rx.done.Close()
+	} else {
+		h.s.registerLocked(rx)
+	}
+	h.s.mu.Unlock()
+	return rx
+}
+
+// Close is hard tear-down: the sender and every live receiver are closed
+// immediately, with no final drain. Use [Sender.Close] for the soft path.
+// Future [Hub.Watch] calls return pre-closed handles. Idempotent.
+func (h *Hub[K, V]) Close() {
+	s := h.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.hubClosed {
+		return
+	}
+	s.hubClosed = true
+	s.txClosed = true
+	for rx := range s.receivers {
+		rx.done.Close()
+	}
+	s.receivers = nil
+	s.index = nil
+}
