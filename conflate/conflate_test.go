@@ -1289,3 +1289,45 @@ func TestConcurrentChanConsumer(t *testing.T) {
 	tx.Close()
 	<-done
 }
+
+// assertLiveCount asserts the lock-free receiver count agrees with the map that
+// owns the truth. This is the structural invariant the whole send fast path
+// rests on: the count may over-report (a publisher then takes the lock and
+// finds nothing, which is the pre-existing behaviour), but a count that
+// under-reports drops a value permanently, since a conflated bus has no retry.
+//
+// Asserting the pair rather than the count alone is what makes a missed
+// syncLiveLocked call site fail here, at the site that is wrong, rather than
+// somewhere downstream as a lost event.
+func assertLiveCount[K comparable, V any](t *testing.T, h *Hub[K, V]) {
+	t.Helper()
+	assert.Equal(t, int64(h.forTestingReceiverCount()), h.forTestingLiveReceivers())
+}
+
+// TestLiveCountTracksTheReceiverSet pins the invariant at every site that
+// mutates s.receivers. The happens-before property the fast path needs — a
+// registration that completed before a Send is observed by that Send — cannot
+// be made to fail deterministically in a Go test; this invariant is what that
+// property rests on, and it can.
+func TestLiveCountTracksTheReceiverSet(t *testing.T) {
+	h := New[int](latestWins)
+	assertLiveCount(t, h) // a fresh hub: the zero value is already correct
+
+	rx1 := h.Receiver()
+	assertLiveCount(t, h)
+	rx2 := h.Receiver()
+	assertLiveCount(t, h)
+
+	rx1.Close()
+	assertLiveCount(t, h)
+
+	// A drain to terminal ErrClosed deregisters the receiver itself, which is a
+	// different route into deregisterLocked than Receiver.Close.
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 10))
+	tx.Close()
+	assertRecv(t, rx2, 1, 10)
+	_, err := rx2.Recv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Equal(t, 0, h.forTestingReceiverCount())
+}

@@ -68,6 +68,7 @@ import (
 	"container/list"
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/internal/buscore"
@@ -108,6 +109,20 @@ type shared[K comparable, V any] struct {
 	txClosed  bool
 	hubClosed bool
 
+	// liveReceivers is a lock-free copy of len(receivers). It is written only
+	// under mu, at every site that mutates that map, and read without mu by the
+	// send side. A publisher may skip the lock entirely when it reads zero: there
+	// is nobody to fan out to, and sendLocked has no other effect.
+	//
+	// Only one direction of error is safe. Over-reporting is free — the publisher
+	// takes the lock and finds nothing, which is what it did before this field
+	// existed. Under-reporting loses a value permanently, because a conflated bus
+	// has no retry: the next send for that key coalesces into a slot the
+	// subscriber was never told had been skipped. That asymmetry is why the count
+	// is *derived* from len(receivers) by syncLiveLocked rather than incremented
+	// and decremented — a derived value cannot drift below the truth.
+	liveReceivers atomic.Int64
+
 	// forTestingBeforeSendLock, if non-nil, runs after SendContext has taken
 	// ctx's Done channel and before it takes mu, so a test can land a
 	// cancellation in the window where the send is waiting for the lock. The
@@ -124,6 +139,12 @@ type shared[K comparable, V any] struct {
 	// The same scope means every concurrent SendContext on the hub runs it, so
 	// a multi-sender test must discriminate inside the func, not by arming.
 	forTestingBeforeSendLock func()
+}
+
+// syncLiveLocked refreshes the lock-free receiver count from the map that owns
+// the truth. Call it at every site that mutates s.receivers. Caller holds s.mu.
+func (s *shared[K, V]) syncLiveLocked() {
+	s.liveReceivers.Store(int64(len(s.receivers)))
 }
 
 // Hub is the construction handle for a conflate pipeline.
@@ -260,6 +281,7 @@ func (h *Hub[K, V]) receiver(opts []ReceiverOption[K, V]) *Receiver[K, V] {
 		rx.done.Close()
 	} else {
 		h.s.receivers[rx] = struct{}{}
+		h.s.syncLiveLocked()
 	}
 	h.s.mu.Unlock()
 	return rx
@@ -476,6 +498,7 @@ func (rx *Receiver[K, V]) drainedLocked() bool {
 // [Receiver.Close]. Caller holds s.mu.
 func (rx *Receiver[K, V]) deregisterLocked() {
 	delete(rx.s.receivers, rx)
+	rx.s.syncLiveLocked()
 }
 
 // signalLocked wakes this receiver's parked readers, if any. Caller holds s.mu.
