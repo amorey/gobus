@@ -115,6 +115,13 @@ fast path answers `nil` where `ErrClosed` is the durable answer.
 poison and the fast path cannot land in separate commits. The subscriber-side
 corollary — register before snapshotting — is stated in `Send`'s doc comment
 because a publisher that skips the lock cannot notice a late subscriber.
+`SendContext`'s fast path answers **only `nil`**, and a cancelled `ctx` falls
+through to the lock: the count and `ctxDone` are two reads at two moments, so a
+`Sender.Close` landing between them would make `ctx.Err()` right at neither
+(`nil` at the load, `ErrClosed` by the select) and would reverse closed >
+cancelled for a caller that ordered the close first. Only `sendLocked` reads
+both under one acquisition, which is where that precedence has to be derived.
+`TestSendContextCancelledOnEmptyHubStillLosesToClose` pins it.
 
 **Two receive paths share that pop.** `recvLoop` (backing `Recv`/`RecvContext`)
 parks on a per-receiver `notify` channel that `signalLocked` closes-and-replaces;

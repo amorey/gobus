@@ -191,20 +191,33 @@ it, and the locked path keeps today's order of checks.
 
 ### 3.6 SendContext
 
-The fast path must not hide a cancellation. A cancelled context must report
-`ctx.Err()`, also on an unwatched hub.
+The fast path must answer `nil` and nothing else. It must never resolve a
+cancellation, and it must never resolve a close.
+
+The reason is that the fast path reads two things at two moments: the count,
+and then `ctxDone`. A `Sender.Close` that lands between them makes a
+cancellation verdict correct at neither moment. At the load the answer is
+`nil`, because the send side is open. At the select the sender is closed, and
+`ErrClosed` outranks the cancellation. A `ctx.Err()` returned there matches no
+state the hub was ever in, and it reverses the documented precedence for a
+caller that ordered the close before the cancellation.
+
+A cancelled context must therefore fall through to the locked path. That path
+reads `txClosed` and `ctxDone` under one acquisition of `s.mu`, which is the
+only place where **closed > cancelled** is derived instead of assembled.
+
+The cost is one lock acquisition for a cancelled send on an unwatched hub. The
+hot path of section 1 is a live context, and it is not affected.
 
 ```go
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	s := tx.s
 	ctxDone := ctx.Done()
 	if s.liveReceivers.Load() == 0 {
-		// A zero count means the send side was open at the load, which is all the
-		// precedence needs: this send resolves at that load, and there is no later
-		// point at which it could observe more. Only the cancellation remains.
 		select {
 		case <-ctxDone:
-			return ctx.Err()
+			// Do not answer here. Fall through, and let the locked path resolve
+			// closed > cancelled from one consistent view.
 		default:
 			return nil
 		}
@@ -215,12 +228,14 @@ func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 
 The order stays **closed > cancelled > value** on both paths:
 
-- A zero count proves that the send side was open **at the load**, because close
-  poisons the count. `ErrClosed` is therefore not a possible answer on the fast
-  path. The load is where this send resolves, so a `Sender.Close` that lands
-  after it is a close that races the call, exactly as today.
-- A poisoned or positive count sends the call to `sendLocked`, which tests
-  `txClosed` before it tests `ctxDone`.
+- A zero count and a live `ctx` resolve the call **at the load**. There is
+  nothing to publish and no error to report, so the verdict comes from one read
+  at one moment. A `Sender.Close` that lands after that load is a close that
+  races the call, exactly as a close landing after the lock is today.
+- Every other case reaches `sendLocked`, which tests `txClosed` before it tests
+  `ctxDone`. This includes every cancelled send.
+- The fast path therefore returns exactly one value, `nil`. Any change that lets
+  it return an error re-opens the two-read defect above.
 
 `ctx.Err()` is still called outside `s.mu`, because the fast path takes no lock.
 `ctx.Done()` is still taken before any lock. The rule that the bus never calls
@@ -479,6 +494,7 @@ coordinate goroutines.
 | `TestSendWithNoReceiversSkipsTheBusLock` | `Send` and `TrySend` on a hub with no receiver return `nil`, and the hook fires zero times. |
 | `TestSendContextWithNoReceiversSkipsTheBusLock` | A live ctx returns `nil`, and the hook fires zero times. |
 | `TestSendContextCancelledWithNoReceiversReportsCancellation` | A cancelled ctx returns `ctx.Err()` on an empty hub. |
+| `TestSendContextCancelledOnEmptyHubStillLosesToClose` | **closed > cancelled** survives the fast path: a `Sender.Close` landing in the window between the count read and the lock outranks the cancellation. Arm the existing send seam to fire the close, as `TestSendContextChecksCancellationAtTheLockNotAtEntry` does. A fast path that answers the cancellation itself never reaches the seam, and fails this test. |
 | `TestClosedSenderReportsErrClosedWithNoReceivers` | `Sender.Close`, then `Receiver.Close`, then `Send` returns `ErrClosed`. This is the poison rule and the main trap. |
 | `TestHubCloseReportsErrClosedWithNoReceivers` | `Hub.Close` clears `receivers`, and `Send` still returns `ErrClosed`. |
 | `TestDrainToErrClosedKeepsTheSenderClosed` | The terminal-`ErrClosed` route into `deregisterLocked`, which `TestClosedSenderReportsErrClosedWithNoReceivers` does not take: the receiver drains itself out of the map instead of being closed by the caller. |

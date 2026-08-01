@@ -1545,3 +1545,30 @@ func TestRegistrationBeforeSendIsAlwaysObserved(t *testing.T) {
 		h.Close()
 	}
 }
+
+// TestSendContextCancelledOnEmptyHubStillLosesToClose pins closed > cancelled
+// for a cancelled send on a hub with no receivers.
+//
+// The fast path reads the receiver count and ctx's Done channel at two
+// different moments. A Sender.Close landing between them makes a cancellation
+// verdict correct at neither: at the count read the answer is nil, and by the
+// select the sender is closed and ErrClosed outranks the cancellation. So a
+// cancelled ctx must not be resolved without the lock, where txClosed and
+// ctxDone are read under one acquisition.
+//
+// The seam stands in for that window. It runs after the fast path has declined
+// to answer and before the lock, so a close fired from it lands exactly where a
+// concurrent Sender.Close would. A fast path that answers the cancellation
+// itself never reaches the seam, and returns context.Canceled here.
+func TestSendContextCancelledOnEmptyHubStillLosesToClose(t *testing.T) {
+	h := New[int](latestWins)
+	tx := h.Sender()
+	require.Zero(t, h.forTestingReceiverCount(), "the fast path is what is under test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancel()
+	h.s.forTestingBeforeSendLock = func() { tx.Close() }
+
+	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), gobus.ErrClosed)
+}

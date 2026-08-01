@@ -423,11 +423,13 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 // no parked state in which a cancellation could arrive — and gates the call on
 // nothing beyond reaching the point where the send is resolved.
 //
-// That single check is made where the send is *resolved*, not on entry. On a
-// hub with no live receiver the send resolves at the lock-free receiver-count
-// read, and a cancelled ctx there still reports ctx.Err() rather than the nil
-// the fast path would otherwise return. Everywhere else the send resolves under
-// s.mu, and the rest of this comment is about that path.
+// That single check is made where the send is *resolved*, not on entry. A live
+// ctx on a hub with no live receiver resolves at the lock-free receiver-count
+// read, with nothing to publish and nothing to report. Every other send —
+// including every cancelled one — resolves under s.mu, so that txClosed and
+// ctxDone are read from one consistent view and closed > cancelled is derived
+// rather than assembled from two reads taken at different moments. The rest of
+// this comment is about that path.
 //
 // So a ctx that was live when SendContext was called but is cancelled
 // by the time this send reaches the front of the lock reports ctx.Err() and
@@ -456,14 +458,23 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	s := tx.s
 	ctxDone := ctx.Done()
-	// The no-receiver fast path, with the cancellation check inside it. A zero
-	// count means the send side was open at the load, so closed > cancelled is
-	// already settled and only the cancellation is left to resolve. The load is
-	// where this send resolves, exactly as the lock is on the path below.
+	// The no-receiver fast path. It answers only nil — never an error — and that
+	// restriction is what keeps it correct.
+	//
+	// A live ctx and a zero count resolve the whole call at the load: there is
+	// nobody to fan out to, and a close landing afterwards is a close that raced
+	// the send, exactly as one landing after the lock is below.
+	//
+	// A cancelled ctx cannot be answered here, because the count and ctxDone are
+	// read at two different moments. A Sender.Close landing between them would
+	// make ctx.Err() correct at neither: at the load the answer is nil, and by
+	// the select the sender is closed and ErrClosed outranks the cancellation.
+	// Falling through costs a cancelled send one lock acquisition and resolves
+	// txClosed and ctxDone from a single consistent view, which is the only
+	// place closed > cancelled can be derived rather than stitched together.
 	if s.liveReceivers.Load() == 0 {
 		select {
 		case <-ctxDone:
-			return ctx.Err()
 		default:
 			return nil
 		}
