@@ -19,6 +19,15 @@ import (
 // Returns [gobus.ErrClosed] if the sender or hub has been closed.
 func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
+	// Zero means no receiver *and* an open send side, since close poisons the
+	// count. There is nothing to fan out to and no other answer to give, so
+	// the hub-wide lock is pure cost here.
+	if s.liveReceivers.Load() == 0 {
+		return nil
+	}
+	if s.forTestingBeforeSendLock != nil {
+		s.forTestingBeforeSendLock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.sendLocked(nil, k, v)
@@ -96,6 +105,7 @@ func (tx *Sender[K, V]) Close() {
 		return
 	}
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.signalLocked()
 	}
@@ -117,6 +127,20 @@ func (tx *Sender[K, V]) Close() {
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	s := tx.s
 	ctxDone := ctx.Done()
+	// The no-receiver fast path answers only nil, and that restriction is what
+	// keeps it correct. A live ctx and a zero count resolve the whole call at
+	// the load. A cancelled ctx cannot be answered here, because the count and
+	// ctxDone are read at two different moments: a Sender.Close landing between
+	// them would make ctx.Err() right at neither — nil at the load, ErrClosed
+	// by the select. Falling through costs one acquisition and derives closed >
+	// cancelled from a single consistent view.
+	if s.liveReceivers.Load() == 0 {
+		select {
+		case <-ctxDone:
+		default:
+			return nil
+		}
+	}
 	if s.forTestingBeforeSendLock != nil {
 		s.forTestingBeforeSendLock()
 	}

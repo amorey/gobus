@@ -123,6 +123,7 @@ func (h *Hub[K, V]) Close() {
 	}
 	s.hubClosed = true
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.done.Close()
 	}
