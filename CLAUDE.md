@@ -75,7 +75,8 @@ environment issue, not a code issue, and does not affect CI (Linux).
   seeded by the caller at `hub.Watch(k, initial)`; `Receiver.Close` is the
   unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
   evaluated per receiver against that receiver's own slot. See
-  `docs/specs/gobus-watch.md` for the specification and the decisions behind it.
+  `docs/adr/2026-08-01-watch-keyed-state-bus.md` for why it exists and what was
+  rejected on the way.
 - `internal/buscore/` — shared building blocks, not part of the public API.
   `CloseOnce` (atomic flag + done channel), used for the lock-free closed
   pre-check on every receive path, and `LiveCount` (the poisoned send-fast-path
