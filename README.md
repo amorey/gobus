@@ -78,6 +78,21 @@ Two cautions. `Peek` takes the same hub lock that serializes the entire `Send` f
 
 The intended use is a consumer that needs to know how far its backlog reaches — a resumable cursor or watermark. Fold the ordering quantity into `V` and let the bus's own `Merge` carry it: stamp each value at publication, keep the *earliest* stamp when two values for a key coalesce, and read it off the head. The bus makes no ordering claim of its own here, so the premise that publication order matches that quantity's order is yours to hold; if it doesn't, the head key's stamp is not the lowest one pending.
 
+#### Publishing with no receivers
+
+`Send` on a hub with no live receiver returns `nil` without taking the bus lock. That lock is hub-wide — every `Send` fan-out, every pop, `Recv`, `Peek`, `TryRecv` and `Close` serializes through it — so the cost of an unwatched hub otherwise lands on the *producer's* hot path, per publish, whether or not anything reads the result. This matters when values are published from inside a producer's own critical sections: without it, every write in a subsystem pays a mutex for a bus nobody is subscribed to.
+
+The result is unchanged, only the cost: a send with no receivers already fanned out to nobody. `TrySend` and `SendContext` take the same path, and a cancelled `ctx` is still reported rather than swallowed. A closed sender still returns `ErrClosed` on an empty receiver set.
+
+The corollary is an ordering requirement on **your** side, and it is the one thing to get right:
+
+```go
+rx := hub.Receiver()   // register FIRST
+state := snapshot()    // then read your snapshot
+```
+
+Take the snapshot before registering and any value published in the gap reaches no receiver — conflate has no replay, and the next `Send` for that key coalesces into a slot your consumer was never told had been skipped. This has always been conflate's delivery model; a publisher that skips the lock simply makes it unforgiving.
+
 [Recv Example](./conflate/examples/recv/main.go) · [Chan Example](./conflate/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
 ## Design notes
@@ -139,7 +154,7 @@ There is no `ErrLagged` equivalent. A conflate receiver that falls behind doesn'
 
 `ErrClosed` outranks context cancellation in `SendContext`: a closed sender returns `ErrClosed` even for an already-cancelled `ctx`, since `ErrClosed` is the durable answer and a retry with a fresh context would only return it anyway. A cancelled `ctx` on a live sender still returns `ctx.Err()`.
 
-`Send` never blocks, so `SendContext` consults `ctx` exactly once — there is no parked state for a cancellation to arrive in. That check happens where the send is *resolved*, under the bus lock, not on entry: a `ctx` that was live at the call but is cancelled by the time the send reaches the front of the lock returns `ctx.Err()` and publishes nothing. Waiting for that lock is real work — your `Merge` and key filters run under it — and a context is a bound on the publish actually happening, not on the function being entered. A cancellation racing the call can land either side of the lock; both outcomes are correct resolutions of that race.
+`Send` never blocks, so `SendContext` consults `ctx` exactly once — there is no parked state for a cancellation to arrive in. That check happens where the send is *resolved*, not on entry. On a hub with no live receiver the send resolves at the lock-free receiver count, and a cancelled `ctx` there is still reported rather than silently succeeding. Otherwise it resolves under the bus lock: a `ctx` that was live at the call but is cancelled by the time the send reaches the front of the lock returns `ctx.Err()` and publishes nothing. Waiting for that lock is real work — your `Merge` and key filters run under it — and a context is a bound on the publish actually happening, not on the function being entered. A cancellation racing the call can land either side of the lock; both outcomes are correct resolutions of that race.
 
 `RecvContext` uses the same precedence, one rank longer: **closed > cancelled > value**. `ErrClosed` wins whenever the receive is terminal — the receiver or the hub is closed, or the sender has closed and this receiver's queue is drained — so a shutdown loop that cancels its own context can still drain to `ErrClosed` rather than spinning on `ctx.Err()`. Otherwise a cancelled `ctx` returns `ctx.Err()` *even when an event is pending*, and that event stays queued rather than being consumed. This is what keeps cancellation observable under load: without it, a consumer looping on `RecvContext` against a publisher fast enough to keep something always pending would take the value every iteration and never notice its own shutdown signal.
 
@@ -167,7 +182,7 @@ A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain de
 
 ### Thread safety
 
-`conflate`'s `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock. A `Receiver` is intended for a single consumer goroutine — it owns an insertion-ordered queue that is meant to be popped by one reader.
+`conflate`'s `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock. `Send` first reads a lock-free receiver count and takes that lock only when a receiver is registered. A `Receiver` is intended for a single consumer goroutine — it owns an insertion-ordered queue that is meant to be popped by one reader.
 
 ### Chan support
 

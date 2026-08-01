@@ -1510,3 +1510,38 @@ func TestSendContextCancelledWithNoReceiversReportsCancellation(t *testing.T) {
 
 	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
 }
+
+// TestRegistrationBeforeSendIsAlwaysObserved states the property the fast path
+// rests on, in the shape a consumer meets it: a registration that completed
+// before a Send is observed by that Send.
+//
+// Know its limit. It is a smoke test, not the pin. No loop count makes a
+// memory-ordering violation deterministic, and this fails only if the store is
+// dropped outright. TestLiveCountTracksTheReceiverSet is what pins the
+// invariant the property rests on; this states the intent and runs under -race.
+//
+// The channel close is the happens-before edge between the registration and the
+// publish. A consumer supplies that edge itself — in the motivating case, by
+// registering and then reading its snapshot under the lock the producer also
+// takes. Nothing is asserted about a genuinely concurrent registration: both
+// answers are correct there, so a test of it would pin nothing.
+func TestRegistrationBeforeSendIsAlwaysObserved(t *testing.T) {
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		h := New[int](latestWins)
+		tx := h.Sender()
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			<-release
+			done <- tx.Send(1, 10)
+		}()
+
+		rx := h.Receiver() // registration completes before the release below
+		close(release)
+		require.NoError(t, <-done)
+
+		assertRecv(t, rx, 1, 10)
+		h.Close()
+	}
+}

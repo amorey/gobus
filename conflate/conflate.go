@@ -45,6 +45,14 @@
 // Send never blocks. Slow receivers cannot apply backpressure to the
 // publisher; they simply coalesce more aggressively.
 //
+// A send with no receivers is cheap. [Sender.Send] returns without taking the
+// bus lock when no receiver is registered, so a hot producer does not pay for a
+// hub nobody is watching. The result is the same one it always gave: nil, with
+// nothing published. The corollary is a subscriber-side ordering requirement —
+// register with [Hub.Receiver] before taking a snapshot of the producer's
+// state, never after — because a value published in that gap reaches no
+// receiver and conflate has no replay.
+//
 // Per-receiver policy overrides, passed as options to [Hub.Receiver].
 // [Hub.WithKeyFilter] filters keys at enqueue time, so a receiver interested
 // in one key out of a high-cardinality producer stays bounded by the keys it
@@ -341,6 +349,20 @@ func (h *Hub[K, V]) Close() {
 // Send publishes v under key k to every receiver. Never blocks. For a receiver
 // that already has k pending, the caller's [Merge] coalesces into that slot;
 // otherwise k is appended at the back of the receiver's queue.
+//
+// A Send to a hub with no live receiver does nothing and returns nil. That has
+// always been the answer — there is nobody to fan out to — but it is now
+// reached without taking the bus lock at all, so a hot producer pays nothing
+// for a bus nobody is reading. Only the cost changes, never the result.
+//
+// This makes one existing requirement load-bearing in a place a reader would
+// not think to look. A subscriber must call [Hub.Receiver] *before* it takes
+// its own snapshot of the producer's state, never after: a value published in
+// the gap reaches no receiver, and conflate has no replay to recover it. The
+// requirement is not new — a receiver has always observed only what was sent
+// after it was created — but a publisher that skips the lock cannot notice a
+// subscriber that arrives late, so getting the order wrong loses the value
+// permanently rather than merely racily.
 func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
 	// Zero means no receiver *and* an open send side, since close poisons the
@@ -398,11 +420,16 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 
 // SendContext behaves like Send, but reports a cancelled ctx instead of
 // publishing. Send never blocks, so ctx is consulted exactly once — there is
-// no parked state in which a cancellation could arrive — and never gates the
-// call on anything but the bus lock.
+// no parked state in which a cancellation could arrive — and gates the call on
+// nothing beyond reaching the point where the send is resolved.
 //
-// That single check is made where the send is *resolved*, under s.mu, not on
-// entry. So a ctx that was live when SendContext was called but is cancelled
+// That single check is made where the send is *resolved*, not on entry. On a
+// hub with no live receiver the send resolves at the lock-free receiver-count
+// read, and a cancelled ctx there still reports ctx.Err() rather than the nil
+// the fast path would otherwise return. Everywhere else the send resolves under
+// s.mu, and the rest of this comment is about that path.
+//
+// So a ctx that was live when SendContext was called but is cancelled
 // by the time this send reaches the front of the lock reports ctx.Err() and
 // publishes nothing. This is deliberate: a caller passing a context is asking
 // for the publish to be bounded by it, and the wait for s.mu is real work —
