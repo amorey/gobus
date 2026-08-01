@@ -74,6 +74,17 @@ import (
 	"github.com/amorey/gobus/internal/buscore"
 )
 
+// sendPoisoned is the value liveReceivers holds once the send side has closed.
+// It is not a count: it only has to be non-zero, so that a closed hub always
+// takes the locked path, where sendLocked reads txClosed and reports ErrClosed.
+//
+// Without it, Hub.Close emptying s.receivers — or the last receiver closing
+// after Sender.Close — would leave a zero count on a closed hub, and the send
+// fast path would answer nil where ErrClosed is the durable answer.
+//
+// The type is explicit so the comparison and the store need no conversion.
+const sendPoisoned int64 = -1
+
 // Merge combines an undelivered pending value with a newly sent value for the
 // same key. It is invoked only when the key already has a pending (not yet
 // delivered) slot. It returns the surviving value and whether to keep the slot;
@@ -121,6 +132,12 @@ type shared[K comparable, V any] struct {
 	// subscriber was never told had been skipped. That asymmetry is why the count
 	// is *derived* from len(receivers) by syncLiveLocked rather than incremented
 	// and decremented — a derived value cannot drift below the truth.
+	//
+	// Closedness is deliberately folded into this one field rather than mirrored
+	// into a second atomic: Sender.Close and Hub.Close store sendPoisoned, and no
+	// later write clears it. That is what lets txClosed stay a plain bool with a
+	// single access discipline — it is read only under mu, on the path the poison
+	// guarantees a closed hub takes.
 	liveReceivers atomic.Int64
 
 	// forTestingBeforeSendLock, if non-nil, runs on every send path that is about
@@ -145,9 +162,21 @@ type shared[K comparable, V any] struct {
 
 // syncLiveLocked refreshes the lock-free receiver count from the map that owns
 // the truth. Call it at every site that mutates s.receivers. Caller holds s.mu.
+//
+// The early return is load-bearing, not defensive: a Receiver.Close after a
+// Sender.Close deregisters through here, and without the guard it would write a
+// zero over the poison and hand a closed hub back to the fast path.
 func (s *shared[K, V]) syncLiveLocked() {
+	if s.liveReceivers.Load() == sendPoisoned {
+		return
+	}
 	s.liveReceivers.Store(int64(len(s.receivers)))
 }
+
+// poisonLiveLocked retires the send fast path for the life of the hub, so every
+// later send reaches sendLocked and is answered from txClosed. Caller holds
+// s.mu.
+func (s *shared[K, V]) poisonLiveLocked() { s.liveReceivers.Store(sendPoisoned) }
 
 // Hub is the construction handle for a conflate pipeline.
 type Hub[K comparable, V any] struct {
@@ -302,6 +331,7 @@ func (h *Hub[K, V]) Close() {
 	}
 	s.hubClosed = true
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.done.Close()
 	}
@@ -313,6 +343,12 @@ func (h *Hub[K, V]) Close() {
 // otherwise k is appended at the back of the receiver's queue.
 func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
+	// Zero means no receiver *and* an open send side, since close poisons the
+	// count. There is nothing to fan out to and no other answer to give, so the
+	// hub-wide lock is pure cost here.
+	if s.liveReceivers.Load() == 0 {
+		return nil
+	}
 	if s.forTestingBeforeSendLock != nil {
 		s.forTestingBeforeSendLock()
 	}
@@ -424,6 +460,7 @@ func (tx *Sender[K, V]) Close() {
 		return
 	}
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.signalLocked()
 	}

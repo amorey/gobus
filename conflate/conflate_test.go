@@ -1322,15 +1322,33 @@ func TestLiveCountTracksTheReceiverSet(t *testing.T) {
 	rx1.Close()
 	assertLiveCount(t, h)
 
-	// A drain to terminal ErrClosed deregisters the receiver itself, which is a
-	// different route into deregisterLocked than Receiver.Close.
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 10))
+
+	// From here the count is poisoned rather than tracking the map. The pair no
+	// longer matches, and must not: a zero on a closed hub would hand the fast
+	// path an ErrClosed to answer as nil.
 	tx.Close()
+	require.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
+
+	// A drain to terminal ErrClosed deregisters the receiver itself, which is a
+	// different route into deregisterLocked than Receiver.Close — and the one
+	// that runs after the poison.
 	assertRecv(t, rx2, 1, 10)
 	_, err := rx2.Recv()
 	require.ErrorIs(t, err, gobus.ErrClosed)
-	assert.Equal(t, 0, h.forTestingReceiverCount())
+	require.Zero(t, h.forTestingReceiverCount())
+	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers(), "deregistration cleared the poison")
+}
+
+// TestHubCloseAlsoPoisonsTheCount pins the second close path. Hub.Close empties
+// s.receivers without going through deregisterLocked, so the poison is the only
+// thing standing between a hard tear-down and a fast path that answers nil.
+func TestHubCloseAlsoPoisonsTheCount(t *testing.T) {
+	h := New[int](latestWins)
+	h.Receiver()
+	h.Close()
+	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
 }
 
 // countSendLocks arms the hub-wide send seam with a lock counter and returns
@@ -1365,4 +1383,99 @@ func TestSendTakesTheBusLockWithAReceiver(t *testing.T) {
 
 	assert.Equal(t, int64(3), locks.Load())
 	assertRecv(t, rx, 1, 10)
+}
+
+// TestSendWithNoReceiversSkipsTheBusLock pins the fast path itself. The lock is
+// hub-wide — every pop, Recv, Peek, TryRecv and Close takes it — so a publisher
+// on an unwatched hub otherwise contends with work it has no consumer for.
+func TestSendWithNoReceiversSkipsTheBusLock(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.TrySend(2, 20))
+
+	assert.Zero(t, locks.Load(), "Send took the bus lock with no receiver")
+}
+
+// TestFastPathFollowsTheReceiverSet pins that the fast path tracks the live
+// receiver set in both directions, rather than being a one-way latch decided at
+// the first send.
+func TestFastPathFollowsTheReceiverSet(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.Zero(t, locks.Load(), "no receiver: no lock")
+
+	rx := h.Receiver()
+	require.NoError(t, tx.Send(1, 10))
+	require.Equal(t, int64(1), locks.Load(), "one receiver: one lock")
+
+	rx.Close()
+	require.NoError(t, tx.Send(1, 10))
+	require.Equal(t, int64(1), locks.Load(), "last receiver closed: no lock")
+
+	h.Receiver()
+	require.NoError(t, tx.Send(1, 10))
+	assert.Equal(t, int64(2), locks.Load(), "new receiver: lock again")
+}
+
+// TestClosedSenderReportsErrClosedWithNoReceivers pins the ordering trap of the
+// fast path: a closed sender must keep reporting ErrClosed even once the
+// receiver set is empty. A count-first check without the poison turns that
+// durable answer into nil.
+//
+// The receiver is closed *after* the sender on purpose. That order is what
+// makes the poison guard in syncLiveLocked load-bearing: the deregistration
+// runs after the poison and must not write a zero over it.
+func TestClosedSenderReportsErrClosedWithNoReceivers(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+
+	tx.Close()
+	rx.Close()
+	require.Zero(t, h.forTestingReceiverCount())
+
+	assert.ErrorIs(t, tx.Send(1, 10), gobus.ErrClosed)
+	assert.ErrorIs(t, tx.TrySend(1, 10), gobus.ErrClosed)
+	assert.ErrorIs(t, tx.SendContext(context.Background(), 1, 10), gobus.ErrClosed)
+}
+
+// TestHubCloseReportsErrClosedWithNoReceivers is the same trap by the other
+// route: Hub.Close empties the receiver map itself, so the count reaches zero
+// without any receiver being closed by the caller.
+func TestHubCloseReportsErrClosedWithNoReceivers(t *testing.T) {
+	h := New[int](latestWins)
+	h.Receiver()
+	tx := h.Sender()
+
+	h.Close()
+	require.Zero(t, h.forTestingReceiverCount())
+
+	assert.ErrorIs(t, tx.Send(1, 10), gobus.ErrClosed)
+}
+
+// TestDrainToErrClosedKeepsTheSenderClosed covers the third route to an empty
+// receiver set: the receiver deregisters *itself* on the terminal ErrClosed of
+// a sender-close drain, rather than being closed by the caller.
+func TestDrainToErrClosedKeepsTheSenderClosed(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	rx := h.Receiver()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	tx.Close()
+	assertRecv(t, rx, 1, 10) // the soft-close drain
+	_, err := rx.Recv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	require.Zero(t, h.forTestingReceiverCount(), "terminal ErrClosed deregisters")
+
+	assert.ErrorIs(t, tx.Send(2, 20), gobus.ErrClosed)
 }
