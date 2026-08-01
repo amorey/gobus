@@ -429,6 +429,18 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	s := tx.s
 	ctxDone := ctx.Done()
+	// The no-receiver fast path, with the cancellation check inside it. A zero
+	// count means the send side was open at the load, so closed > cancelled is
+	// already settled and only the cancellation is left to resolve. The load is
+	// where this send resolves, exactly as the lock is on the path below.
+	if s.liveReceivers.Load() == 0 {
+		select {
+		case <-ctxDone:
+			return ctx.Err()
+		default:
+			return nil
+		}
+	}
 	if s.forTestingBeforeSendLock != nil {
 		s.forTestingBeforeSendLock()
 	}

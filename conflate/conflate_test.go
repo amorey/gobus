@@ -1479,3 +1479,34 @@ func TestDrainToErrClosedKeepsTheSenderClosed(t *testing.T) {
 
 	assert.ErrorIs(t, tx.Send(2, 20), gobus.ErrClosed)
 }
+
+// TestSendContextWithNoReceiversSkipsTheBusLock pins that SendContext inherits
+// the fast path. Its own cancellation check is what keeps it from being a plain
+// delegation to Send.
+func TestSendContextWithNoReceiversSkipsTheBusLock(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.SendContext(context.Background(), 1, 10))
+
+	assert.Zero(t, locks.Load(), "SendContext took the bus lock with no receiver")
+}
+
+// TestSendContextCancelledWithNoReceiversReportsCancellation pins that the fast
+// path does not swallow a cancellation. Written green: the locked path already
+// reported ctx.Err() here, and this guards the branch that replaces it.
+//
+// Only the return value is assertable. A hub with no receiver publishes nowhere
+// either way, and a receiver created afterwards observes no history, so there is
+// no "the value was not published" to assert that would fail against a mutant.
+func TestSendContextCancelledWithNoReceiversReportsCancellation(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
+}
