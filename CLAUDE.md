@@ -26,6 +26,7 @@ go test ./...                        # all tests
 go test -race ./...                  # what CI runs
 go test -run TestAnnihilation ./conflate   # a single test
 go run ./conflate/examples/recv      # runnable examples
+go run ./watch/examples/chan
 ```
 
 Lint gates, all of which CI enforces separately:

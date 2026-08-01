@@ -132,7 +132,7 @@ Three things distinguish it from `conflate`:
 
 `Send` for a key nobody watches is dropped, and nothing is retained: there is no receiver and therefore no buffer. `Send` on a hub with no receiver at all returns `nil` without taking the bus lock, exactly as `conflate` does.
 
-[Docs](https://pkg.go.dev/github.com/amorey/gobus/watch)
+[Recv Example](./watch/examples/recv/main.go) · [Chan Example](./watch/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/watch)
 
 
 ## Design notes
