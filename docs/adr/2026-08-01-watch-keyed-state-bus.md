@@ -11,6 +11,9 @@
   when it does?" This answers yes to both: `watch` gates `Send` on the same
   count, and it now lives in `buscore.LiveCount` with `conflate` migrated onto
   it. The 2026-07-28 `Peek` decision is unaffected; `watch` ships no `Peek`.
+- **Amended by:** the 2026-08-01 `watch`-`Peek` decision, which gave it one. The
+  `Peek` sentence above records the position as accepted, not the position
+  today.
 - **Record:** the downstream consumer's original proposal, the specification
   drafted from it and their reply to that specification are not retained in the
   repository. This ADR is the record; where it says "the requester", the

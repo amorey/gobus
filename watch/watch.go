@@ -16,6 +16,9 @@
 //
 // The bus does not deliver the baseline back: it is the caller's own argument,
 // and a receiver reads a value only once a [Sender.Send] supersedes it.
+// [Receiver.Peek] shows that unread value without taking it, under the same
+// closed > value precedence the taking paths use — so it too reports nothing
+// for a receiver still on its baseline.
 //
 // # One key for each receiver
 //
@@ -382,12 +385,13 @@ type Receiver[K comparable, V any] struct {
 	chOnce sync.Once
 	ch     chan gobus.Event[K, V]
 
-	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock and
-	// forTestingFeederBeforeLock, if non-nil, run after a lock-free closed
-	// check and before taking s.mu, so tests can exercise the
-	// close-wins-the-race re-check under the lock. forTestingFeederParked runs
-	// after the feeder snapshots a value and before it enters the delivery
-	// select, so a test can land a newer value inside that window.
+	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock,
+	// forTestingBeforePeekLock and forTestingFeederBeforeLock, if non-nil, run
+	// after a lock-free closed check and before taking s.mu, so tests can
+	// exercise the close-wins-the-race re-check under the lock.
+	// forTestingFeederParked runs after the feeder snapshots a value and
+	// before it enters the delivery select, so a test can land a newer value
+	// inside that window.
 	//
 	// forTestingFeederExit runs on the way out, just before the channel is
 	// closed. It is what lets a test wait for the feeder without reading the
@@ -399,6 +403,7 @@ type Receiver[K comparable, V any] struct {
 	// feeder, or the write races the feeder's read.
 	forTestingBeforeRecvLock    func()
 	forTestingBeforeTryRecvLock func()
+	forTestingBeforePeekLock    func()
 	forTestingFeederBeforeLock  func()
 	forTestingFeederParked      func()
 	forTestingFeederExit        func()
@@ -428,11 +433,19 @@ func (rx *Receiver[K, V]) signalLocked() {
 // taken. Caller holds s.mu.
 func (rx *Receiver[K, V]) unreadLocked() bool { return rx.version > rx.lastSeen }
 
+// eventLocked returns the slot's current contents without marking it read. It
+// is the one place an Event is built from a slot, so the peeking and the
+// taking paths cannot drift about what a receiver's value is. Caller holds
+// s.mu.
+func (rx *Receiver[K, V]) eventLocked() gobus.Event[K, V] {
+	return gobus.Event[K, V]{Key: rx.key, Value: rx.val}
+}
+
 // takeLocked marks the slot read and returns its value. Caller holds s.mu, and
 // must have found unreadLocked true.
 func (rx *Receiver[K, V]) takeLocked() gobus.Event[K, V] {
 	rx.lastSeen = rx.version
-	return gobus.Event[K, V]{Key: rx.key, Value: rx.val}
+	return rx.eventLocked()
 }
 
 // drainedLocked reports whether the stream has ended: the sender is gone and
@@ -481,6 +494,58 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 	}
 	if rx.unreadLocked() {
 		return rx.takeLocked(), nil
+	}
+	return zero, gobus.ErrEmpty
+}
+
+// Peek returns the value a receive would hand back, without taking it: a
+// subsequent [Receiver.Recv] or [Receiver.TryRecv] still returns it. It is
+// TryRecv minus the take, and shares its precedence exactly —
+// [gobus.ErrClosed] if the receiver or hub is closed, or the sender is closed
+// and the final value has been taken; [gobus.ErrEmpty] if nothing has
+// superseded what this receiver has already seen.
+//
+// It is therefore *not* a read of the key's current state: a receiver that has
+// caught up reports ErrEmpty even though its slot holds a perfectly good
+// value, and a closed handle reports ErrClosed with one waiting. Keep your own
+// copy of the last value read if you need the current state on demand — that
+// is what the reading goroutine already has, and it costs no lock.
+//
+// Between two Peeks the key is fixed — a receiver watches one key for its
+// whole life — but the value is not: a [Sender.Send] this receiver's [Accept]
+// takes replaces the slot, so the second Peek reports the newer value and the
+// older one is never handed back by either path. That is the same skip-ahead
+// every read on this bus is subject to, only visible without consuming.
+//
+// Peek takes the hub lock, the same one that serializes the whole Send
+// fan-out, so polling it in a loop slows every publisher and every other
+// receiver on the hub. Call it once per unit of work, not as a spin.
+//
+// Peek is safe to call from any goroutine, but like the rest of the receive
+// side it is only meaningful on the receiver's single consuming goroutine: a
+// concurrent Recv, TryRecv or [Receiver.Chan] feeder may take the value before
+// the caller can act on it. Unlike conflate's Peek, a value already handed to
+// the feeder is still visible here — the feeder marks it read only once the
+// consumer has taken it, so Peek reports the value in flight rather than
+// ErrEmpty.
+func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], error) {
+	var zero gobus.Event[K, V]
+	if rx.done.IsClosed() {
+		return zero, gobus.ErrClosed
+	}
+	if rx.forTestingBeforePeekLock != nil {
+		rx.forTestingBeforePeekLock()
+	}
+	rx.s.mu.Lock()
+	defer rx.s.mu.Unlock()
+	// The same ordered run TryRecv makes, minus the take. A peek is a read like
+	// any other, so a receiver that reaches its terminal answer here owes the
+	// same tear-down, which terminalLocked carries.
+	if rx.terminalLocked() {
+		return zero, gobus.ErrClosed
+	}
+	if rx.unreadLocked() {
+		return rx.eventLocked(), nil
 	}
 	return zero, gobus.ErrEmpty
 }
@@ -664,7 +729,7 @@ func (rx *Receiver[K, V]) feed() {
 		// unread before drained, unlike the reading paths: a sender-close must
 		// still hand over the final value before the channel closes.
 		if rx.unreadLocked() {
-			ev := gobus.Event[K, V]{Key: rx.key, Value: rx.val}
+			ev := rx.eventLocked()
 			ver := rx.version
 			notify := rx.notify
 			rx.waiters++

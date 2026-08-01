@@ -126,6 +126,14 @@ func assertRecv(t *testing.T, rx *Receiver[string, val], want gobus.Event[string
 	assert.Equal(t, want, ev)
 }
 
+// assertPeek is assertRecv's non-consuming twin, for the same reason.
+func assertPeek(t *testing.T, rx *Receiver[string, val], want gobus.Event[string, val]) {
+	t.Helper()
+	ev, err := rx.Peek()
+	require.NoError(t, err)
+	assert.Equal(t, want, ev)
+}
+
 func TestSendReachesTheWatchingReceiver(t *testing.T) {
 	h := New[string, val]()
 	rx := h.Watch("a", val{N: 1})
@@ -458,6 +466,142 @@ func TestCloseRaceIsResolvedUnderTheLockForRecv(t *testing.T) {
 	rx.forTestingBeforeRecvLock = func() { rx.Close() }
 	_, err := rx.Recv()
 	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+func TestPeekDoesNotConsume(t *testing.T) {
+	// Two Peeks report the same value while nothing supersedes it, and it is
+	// still there for the read that actually takes it.
+	h := New[string](WithAccept(bySeq))
+	rx := h.Watch("a", val{N: 1, Seq: 1})
+	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 2}))
+
+	want := gobus.Event[string, val]{Key: "a", Value: val{N: 2, Seq: 2}}
+	assertPeek(t, rx, want)
+	assertPeek(t, rx, want)
+
+	// The key is fixed for a receiver's whole life, but the value is not: an
+	// accepted Send replaces the slot, so the next Peek reports the newer
+	// value and the superseded one is never handed back by any path.
+	require.NoError(t, h.Sender().Send("a", val{N: 3, Seq: 3}))
+	newest := gobus.Event[string, val]{Key: "a", Value: val{N: 3, Seq: 3}}
+	assertPeek(t, rx, newest)
+	assertRecv(t, rx, newest)
+}
+
+func TestPeekReportsWhatIsUnreadNotTheCurrentState(t *testing.T) {
+	// Peek is TryRecv minus the take, not a read of the key's state: the
+	// baseline is not peekable, and neither is a value already taken.
+	h := New[string, val]()
+	rx := h.Watch("a", val{N: 1})
+
+	_, err := rx.Peek()
+	require.ErrorIs(t, err, gobus.ErrEmpty, "the baseline is not a delivery")
+
+	require.NoError(t, h.Sender().Send("a", val{N: 2}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
+
+	_, err = rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "the slot holds a value, but nothing is unread")
+}
+
+// TestPeekPrecedenceMatchesTryRecv pins that Peek is not a raw-state read: a
+// closed handle reports ErrClosed even with an unread value waiting, exactly
+// as TryRecv does.
+func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		close func(*Hub[string, val], *Receiver[string, val])
+	}{
+		{"receiver", func(_ *Hub[string, val], rx *Receiver[string, val]) { rx.Close() }},
+		{"hub", func(h *Hub[string, val], _ *Receiver[string, val]) { h.Close() }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := New[string, val]()
+			rx := h.Watch("a", val{N: 1})
+			require.NoError(t, h.Sender().Send("a", val{N: 2}))
+			tc.close(h, rx)
+
+			_, err := rx.Peek()
+			assert.ErrorIs(t, err, gobus.ErrClosed,
+				"ErrClosed is not a statement that nothing was unread")
+		})
+	}
+}
+
+func TestPeekDrainsThenReportsClosed(t *testing.T) {
+	// Sender.Close is the soft path, so the final value is still peekable —
+	// and peeking it does not consume it.
+	h := New[string, val]()
+	rx := h.Watch("a", val{N: 1})
+	require.NoError(t, h.Sender().Send("a", val{N: 2}))
+	h.Sender().Close()
+
+	want := gobus.Event[string, val]{Key: "a", Value: val{N: 2}}
+	assertPeek(t, rx, want)
+	assertRecv(t, rx, want)
+
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	// The terminal verdict owes the same tear-down whichever path derives it.
+	assert.Zero(t, h.forTestingReceiverCount(), "the terminal Peek skipped deregistration")
+	assert.Zero(t, h.forTestingKeyCount(), "R5 holds on the Peek exit path too")
+}
+
+func TestPeekCloseRaceIsResolvedUnderTheLock(t *testing.T) {
+	h := New[string, val]()
+	rx := h.Watch("a", val{N: 1})
+	require.NoError(t, h.Sender().Send("a", val{N: 2}))
+
+	rx.forTestingBeforePeekLock = func() { rx.Close() }
+	_, err := rx.Peek()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// TestPeekSeesTheValueInFlightToTheFeeder is where this bus differs from
+// conflate: the feeder marks a value read only once the consumer has taken it,
+// so the value it is holding is still unread and Peek reports it.
+func TestPeekSeesTheValueInFlightToTheFeeder(t *testing.T) {
+	h := New[string, val]()
+	rx := h.Watch("a", val{N: 1})
+	defer rx.Close()
+
+	// The hook runs on the feeder goroutine, so the result is carried back to
+	// the test goroutine to assert on: a require here would Goexit the feeder
+	// and park the test on the channel below until the package timeout.
+	type peek struct {
+		ev  gobus.Event[string, val]
+		err error
+	}
+	peeked := make(chan peek, 1)
+	rx.forTestingFeederParked = func() {
+		rx.forTestingFeederParked = nil
+		ev, err := rx.Peek()
+		peeked <- peek{ev, err}
+	}
+	ch := rx.Chan()
+	require.NoError(t, h.Sender().Send("a", val{N: 2}))
+
+	want := gobus.Event[string, val]{Key: "a", Value: val{N: 2}}
+	got := <-peeked
+	require.NoError(t, got.err)
+	assert.Equal(t, want, got.ev)
+	assert.Equal(t, want, <-ch)
+}
+
+// peekSink is a package-level sink for the allocation test. Assigning the
+// returned Event to a local would let the escape analysis of the test body,
+// rather than Peek itself, decide the result.
+var peekSink gobus.Event[string, val]
+
+func TestPeekAllocatesNothing(t *testing.T) {
+	h := New[string, val]()
+	rx := h.Watch("a", val{N: 1})
+	require.NoError(t, h.Sender().Send("a", val{N: 2}))
+
+	// Three field reads and a struct return: nothing to allocate.
+	avg := testing.AllocsPerRun(100, func() { peekSink, _ = rx.Peek() })
+	assert.Zero(t, avg, "Peek should allocate nothing")
+	assert.Equal(t, gobus.Event[string, val]{Key: "a", Value: val{N: 2}}, peekSink)
 }
 
 func TestRecvContextReturnsAValue(t *testing.T) {
