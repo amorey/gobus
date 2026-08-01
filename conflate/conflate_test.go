@@ -5,6 +5,7 @@ import (
 	"errors"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1288,4 +1289,286 @@ func TestConcurrentChanConsumer(t *testing.T) {
 	}
 	tx.Close()
 	<-done
+}
+
+// assertLiveCount asserts the lock-free receiver count agrees with the map that
+// owns the truth. This is the structural invariant the whole send fast path
+// rests on: the count may over-report (a publisher then takes the lock and
+// finds nothing, which is the pre-existing behaviour), but a count that
+// under-reports drops a value permanently, since a conflated bus has no retry.
+//
+// Asserting the pair rather than the count alone is what makes a missed
+// syncLiveLocked call site fail here, at the site that is wrong, rather than
+// somewhere downstream as a lost event.
+func assertLiveCount[K comparable, V any](t *testing.T, h *Hub[K, V]) {
+	t.Helper()
+	assert.Equal(t, int64(h.forTestingReceiverCount()), h.forTestingLiveReceivers())
+}
+
+// TestLiveCountTracksTheReceiverSet pins the invariant at every site that
+// mutates s.receivers. The happens-before property the fast path needs — a
+// registration that completed before a Send is observed by that Send — cannot
+// be made to fail deterministically in a Go test; this invariant is what that
+// property rests on, and it can.
+func TestLiveCountTracksTheReceiverSet(t *testing.T) {
+	h := New[int](latestWins)
+	assertLiveCount(t, h) // a fresh hub: the zero value is already correct
+
+	rx1 := h.Receiver()
+	assertLiveCount(t, h)
+	rx2 := h.Receiver()
+	assertLiveCount(t, h)
+
+	rx1.Close()
+	assertLiveCount(t, h)
+
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 10))
+
+	// From here the count is poisoned rather than tracking the map. The pair no
+	// longer matches, and must not: a zero on a closed hub would hand the fast
+	// path an ErrClosed to answer as nil.
+	tx.Close()
+	require.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
+
+	// A drain to terminal ErrClosed deregisters the receiver itself, which is a
+	// different route into deregisterLocked than Receiver.Close — and the one
+	// that runs after the poison.
+	assertRecv(t, rx2, 1, 10)
+	_, err := rx2.Recv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	require.Zero(t, h.forTestingReceiverCount())
+	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers(), "deregistration cleared the poison")
+}
+
+// TestHubCloseAlsoPoisonsTheCount pins the second close path. Hub.Close empties
+// s.receivers without going through deregisterLocked, so the poison is the only
+// thing standing between a hard tear-down and a fast path that answers nil.
+func TestHubCloseAlsoPoisonsTheCount(t *testing.T) {
+	h := New[int](latestWins)
+	h.Receiver()
+	h.Close()
+	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
+}
+
+// countSendLocks arms the hub-wide send seam with a lock counter and returns
+// it. The seam runs only on the path that takes s.mu, so a zero count is proof
+// that a send skipped the lock — no timing and no second field.
+//
+// The counter is atomic because the seam runs on the *sending* goroutine. Every
+// caller below is single-goroutine, where a plain int would do, but a later
+// edit that adds a publisher must not turn this into a silent data race. Arming
+// itself is still only safe while no send is in flight: the field is hub-wide
+// and is read outside s.mu.
+func countSendLocks[K comparable, V any](h *Hub[K, V]) *atomic.Int64 {
+	var locks atomic.Int64
+	h.s.forTestingBeforeSendLock = func() { locks.Add(1) }
+	return &locks
+}
+
+// TestSendTakesTheBusLockWithAReceiver pins that the send seam reports the
+// locked path from Send, and not only from SendContext. Without this, the
+// no-receiver assertions below would be vacuous: a lock counter that Send never
+// increments reads zero whether or not a fast path exists.
+func TestSendTakesTheBusLockWithAReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	rx := h.Receiver()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.TrySend(2, 20))
+	require.NoError(t, tx.SendContext(context.Background(), 3, 30))
+
+	assert.Equal(t, int64(3), locks.Load())
+	assertRecv(t, rx, 1, 10)
+}
+
+// TestSendWithNoReceiversSkipsTheBusLock pins the fast path itself. The lock is
+// hub-wide — every pop, Recv, Peek, TryRecv and Close takes it — so a publisher
+// on an unwatched hub otherwise contends with work it has no consumer for.
+func TestSendWithNoReceiversSkipsTheBusLock(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.TrySend(2, 20))
+
+	assert.Zero(t, locks.Load(), "Send took the bus lock with no receiver")
+}
+
+// TestFastPathFollowsTheReceiverSet pins that the fast path tracks the live
+// receiver set in both directions, rather than being a one-way latch decided at
+// the first send.
+func TestFastPathFollowsTheReceiverSet(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.Send(1, 10))
+	require.Zero(t, locks.Load(), "no receiver: no lock")
+
+	rx := h.Receiver()
+	require.NoError(t, tx.Send(1, 10))
+	require.Equal(t, int64(1), locks.Load(), "one receiver: one lock")
+
+	rx.Close()
+	require.NoError(t, tx.Send(1, 10))
+	require.Equal(t, int64(1), locks.Load(), "last receiver closed: no lock")
+
+	h.Receiver()
+	require.NoError(t, tx.Send(1, 10))
+	assert.Equal(t, int64(2), locks.Load(), "new receiver: lock again")
+}
+
+// TestClosedSenderReportsErrClosedWithNoReceivers pins the ordering trap of the
+// fast path: a closed sender must keep reporting ErrClosed even once the
+// receiver set is empty. A count-first check without the poison turns that
+// durable answer into nil.
+//
+// The receiver is closed *after* the sender on purpose. That order is what
+// makes the poison guard in syncLiveLocked load-bearing: the deregistration
+// runs after the poison and must not write a zero over it.
+func TestClosedSenderReportsErrClosedWithNoReceivers(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+
+	tx.Close()
+	rx.Close()
+	require.Zero(t, h.forTestingReceiverCount())
+
+	assert.ErrorIs(t, tx.Send(1, 10), gobus.ErrClosed)
+	assert.ErrorIs(t, tx.TrySend(1, 10), gobus.ErrClosed)
+	assert.ErrorIs(t, tx.SendContext(context.Background(), 1, 10), gobus.ErrClosed)
+}
+
+// TestHubCloseReportsErrClosedWithNoReceivers is the same trap by the other
+// route: Hub.Close empties the receiver map itself, so the count reaches zero
+// without any receiver being closed by the caller.
+func TestHubCloseReportsErrClosedWithNoReceivers(t *testing.T) {
+	h := New[int](latestWins)
+	h.Receiver()
+	tx := h.Sender()
+
+	h.Close()
+	require.Zero(t, h.forTestingReceiverCount())
+
+	assert.ErrorIs(t, tx.Send(1, 10), gobus.ErrClosed)
+}
+
+// TestDrainToErrClosedKeepsTheSenderClosed covers the third route to an empty
+// receiver set: the receiver deregisters *itself* on the terminal ErrClosed of
+// a sender-close drain, rather than being closed by the caller.
+func TestDrainToErrClosedKeepsTheSenderClosed(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	rx := h.Receiver()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	tx.Close()
+	assertRecv(t, rx, 1, 10) // the soft-close drain
+	_, err := rx.Recv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+	require.Zero(t, h.forTestingReceiverCount(), "terminal ErrClosed deregisters")
+
+	assert.ErrorIs(t, tx.Send(2, 20), gobus.ErrClosed)
+}
+
+// TestSendContextWithNoReceiversSkipsTheBusLock pins that SendContext inherits
+// the fast path. Its own cancellation check is what keeps it from being a plain
+// delegation to Send.
+func TestSendContextWithNoReceiversSkipsTheBusLock(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	locks := countSendLocks(h)
+
+	require.NoError(t, tx.SendContext(context.Background(), 1, 10))
+
+	assert.Zero(t, locks.Load(), "SendContext took the bus lock with no receiver")
+}
+
+// TestSendContextCancelledWithNoReceiversReportsCancellation pins that the fast
+// path does not swallow a cancellation. Written green: the locked path already
+// reported ctx.Err() here, and this guards the branch that replaces it.
+//
+// Only the return value is assertable. A hub with no receiver publishes nowhere
+// either way, and a receiver created afterwards observes no history, so there is
+// no "the value was not published" to assert that would fail against a mutant.
+func TestSendContextCancelledWithNoReceiversReportsCancellation(t *testing.T) {
+	h := New[int](latestWins)
+	defer h.Close()
+	tx := h.Sender()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
+}
+
+// TestRegistrationBeforeSendIsAlwaysObserved states the property the fast path
+// rests on, in the shape a consumer meets it: a registration that completed
+// before a Send is observed by that Send.
+//
+// Know its limit. It is a smoke test, not the pin. No loop count makes a
+// memory-ordering violation deterministic, and this fails only if the store is
+// dropped outright. TestLiveCountTracksTheReceiverSet is what pins the
+// invariant the property rests on; this states the intent and runs under -race.
+//
+// The channel close is the happens-before edge between the registration and the
+// publish. A consumer supplies that edge itself — in the motivating case, by
+// registering and then reading its snapshot under the lock the producer also
+// takes. Nothing is asserted about a genuinely concurrent registration: both
+// answers are correct there, so a test of it would pin nothing.
+func TestRegistrationBeforeSendIsAlwaysObserved(t *testing.T) {
+	const rounds = 200
+	for i := 0; i < rounds; i++ {
+		h := New[int](latestWins)
+		tx := h.Sender()
+		release := make(chan struct{})
+		done := make(chan error, 1)
+		go func() {
+			<-release
+			done <- tx.Send(1, 10)
+		}()
+
+		rx := h.Receiver() // registration completes before the release below
+		close(release)
+		require.NoError(t, <-done)
+
+		assertRecv(t, rx, 1, 10)
+		h.Close()
+	}
+}
+
+// TestSendContextCancelledOnEmptyHubStillLosesToClose pins closed > cancelled
+// for a cancelled send on a hub with no receivers.
+//
+// The fast path reads the receiver count and ctx's Done channel at two
+// different moments. A Sender.Close landing between them makes a cancellation
+// verdict correct at neither: at the count read the answer is nil, and by the
+// select the sender is closed and ErrClosed outranks the cancellation. So a
+// cancelled ctx must not be resolved without the lock, where txClosed and
+// ctxDone are read under one acquisition.
+//
+// The seam stands in for that window. It runs after the fast path has declined
+// to answer and before the lock, so a close fired from it lands exactly where a
+// concurrent Sender.Close would. A fast path that answers the cancellation
+// itself never reaches the seam, and returns context.Canceled here.
+func TestSendContextCancelledOnEmptyHubStillLosesToClose(t *testing.T) {
+	h := New[int](latestWins)
+	tx := h.Sender()
+	require.Zero(t, h.forTestingReceiverCount(), "the fast path is what is under test")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cancel()
+	h.s.forTestingBeforeSendLock = func() { tx.Close() }
+
+	assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), gobus.ErrClosed)
 }

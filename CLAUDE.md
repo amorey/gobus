@@ -98,6 +98,31 @@ merges into the existing slot via `Merge`, leaving queue position unchanged. A
 therefore a plain pop (`popLocked`). This is what bounds a receiver's memory by
 the live key set rather than write volume.
 
+**The send side skips the lock when nobody is listening.**
+`shared.liveReceivers` is a lock-free copy of `len(s.receivers)`, written under
+`s.mu` at every site that mutates the map (`receiver`, `deregisterLocked`) and
+read without it by `Send`/`SendContext`. Zero means "no receiver, send side
+open" and is the only state in which a publisher may return early.
+`syncLiveLocked` *derives* the count rather than incrementing it, because only
+one direction of error is safe: over-reporting costs one uncontended lock,
+while under-reporting drops a value permanently — a conflated bus has no retry,
+so the next `Send` for that key coalesces into a slot the subscriber was never
+told had been skipped. `Sender.Close` and `Hub.Close` store `sendPoisoned`, and
+`syncLiveLocked`'s early return is what holds it: without that guard a
+`Receiver.Close` *after* a `Sender.Close` writes a zero over the poison and the
+fast path answers `nil` where `ErrClosed` is the durable answer.
+`TestSenderCloseDrainsThenErrClosed` already catches that, which is why the
+poison and the fast path cannot land in separate commits. The subscriber-side
+corollary — register before snapshotting — is stated in `Send`'s doc comment
+because a publisher that skips the lock cannot notice a late subscriber.
+`SendContext`'s fast path answers **only `nil`**, and a cancelled `ctx` falls
+through to the lock: the count and `ctxDone` are two reads at two moments, so a
+`Sender.Close` landing between them would make `ctx.Err()` right at neither
+(`nil` at the load, `ErrClosed` by the select) and would reverse closed >
+cancelled for a caller that ordered the close first. Only `sendLocked` reads
+both under one acquisition, which is where that precedence has to be derived.
+`TestSendContextCancelledOnEmptyHubStillLosesToClose` pins it.
+
 **Two receive paths share that pop.** `recvLoop` (backing `Recv`/`RecvContext`)
 parks on a per-receiver `notify` channel that `signalLocked` closes-and-replaces;
 `feed` is a per-receiver goroutine backing `Chan`. Both must stay consistent —
@@ -118,8 +143,10 @@ verdict is produced; an arm that returned `ErrClosed`/`ctx.Err()` itself would
 let a close racing a cancellation resolve by select roulette and skip the
 terminal deregistration. `SendContext` is the send-side twin: closed >
 cancelled, both tests under one acquisition of `s.mu`, delegating the fan-out
-to `sendLocked` — so no bus state is read outside the lock and `txClosed` stays
-a plain `bool`. What is *not* done under `s.mu` on either side is calling into
+to `sendLocked` — so the only bus state read outside the lock is
+`liveReceivers` (see the send fast path below), and `txClosed` stays a plain
+`bool` because the poison keeps every closed hub on the locked path where it is
+read. What is *not* done under `s.mu` on either side is calling into
 the caller's `context.Context`: `sendLocked` and `recvLoop` both take an
 already-obtained `Done` channel into the locked region and resolve `ctx.Err()`
 only after releasing, because a user-supplied context's methods are arbitrary
@@ -136,9 +163,11 @@ expired while the send waited for the lock, which keeps every verdict in the
 package derived from state read at the decision point. Read it before
 "restoring" the pre-check — the entry-snapshot form still passes every other
 test. gochan makes `txClosed` an `atomic.Bool` because its
-`watch`/`broadcast` read it from a lock-free `TryRecv` fast path; conflate has
-no such path (its only lock-free pre-check is `rx.done`), so copying the atomic
-here would buy nothing and give one field two access disciplines.
+`watch`/`broadcast` read it from a lock-free `TryRecv` fast path; conflate's two
+lock-free pre-checks are `rx.done` and `liveReceivers`, and neither needs it —
+`rx.done` is its own atomic, and `liveReceivers` carries closedness in its
+poison, so a closed hub always reaches the locked read. Copying the atomic here
+would buy nothing and give one field two access disciplines.
 
 **Nil means default on a receiver's policy fields.** `keep == nil` accepts all
 keys; `merge == nil` falls back to the hub's shared merge (always non-nil, since
@@ -181,7 +210,14 @@ Mirror `gochan`'s conventions unless there's a reason not to.
   a value. `Close` serializes through the same mutex, so that re-check is what
   makes "close wins the race" correct rather than best-effort. Every such
   re-check has a `forTesting*` hook so the race can be exercised
-  deterministically.
+  deterministically. The send fast path is not an exception: `liveReceivers` is
+  a no-op check, not a closed check — it asks whether there is any work, never
+  whether the bus is alive — and the poison is what keeps closedness out of it,
+  so a closed hub is never resolved without the lock. It hands back no value, so
+  there is nothing to re-check. The hook rule still applies:
+  `forTestingBeforeSendLock` runs on every send path that is about to take
+  `s.mu` and on neither fast path, which is how a test proves the lock was
+  skipped without timing.
 - Don't call `Hub.Close` concurrently with an active `Send` from another
   goroutine — it inherits the sender's close discipline.
 

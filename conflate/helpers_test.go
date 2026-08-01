@@ -14,3 +14,13 @@ func (h *Hub[K, V]) forTestingReceiverCount() int {
 	defer h.s.mu.Unlock()
 	return len(h.s.receivers)
 }
+
+// forTestingLiveReceivers returns the lock-free receiver count that gates the
+// send fast path. It takes s.mu so a test reads it and len(s.receivers) as one
+// consistent pair; the fast path itself reads the field without the lock, which
+// is the whole point of the field.
+func (h *Hub[K, V]) forTestingLiveReceivers() int64 {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.liveReceivers.Load()
+}

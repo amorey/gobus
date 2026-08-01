@@ -45,6 +45,14 @@
 // Send never blocks. Slow receivers cannot apply backpressure to the
 // publisher; they simply coalesce more aggressively.
 //
+// A send with no receivers is cheap. [Sender.Send] returns without taking the
+// bus lock when no receiver is registered, so a hot producer does not pay for a
+// hub nobody is watching. The result is the same one it always gave: nil, with
+// nothing published. The corollary is a subscriber-side ordering requirement —
+// register with [Hub.Receiver] before taking a snapshot of the producer's
+// state, never after — because a value published in that gap reaches no
+// receiver and conflate has no replay.
+//
 // Per-receiver policy overrides, passed as options to [Hub.Receiver].
 // [Hub.WithKeyFilter] filters keys at enqueue time, so a receiver interested
 // in one key out of a high-cardinality producer stays bounded by the keys it
@@ -68,10 +76,22 @@ import (
 	"container/list"
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/internal/buscore"
 )
+
+// sendPoisoned is the value liveReceivers holds once the send side has closed.
+// It is not a count: it only has to be non-zero, so that a closed hub always
+// takes the locked path, where sendLocked reads txClosed and reports ErrClosed.
+//
+// Without it, Hub.Close emptying s.receivers — or the last receiver closing
+// after Sender.Close — would leave a zero count on a closed hub, and the send
+// fast path would answer nil where ErrClosed is the durable answer.
+//
+// The type is explicit so the comparison and the store need no conversion.
+const sendPoisoned int64 = -1
 
 // Merge combines an undelivered pending value with a newly sent value for the
 // same key. It is invoked only when the key already has a pending (not yet
@@ -108,10 +128,32 @@ type shared[K comparable, V any] struct {
 	txClosed  bool
 	hubClosed bool
 
-	// forTestingBeforeSendLock, if non-nil, runs after SendContext has taken
-	// ctx's Done channel and before it takes mu, so a test can land a
-	// cancellation in the window where the send is waiting for the lock. The
-	// send-side twin of forTestingBeforeRecvLock. nil in production.
+	// liveReceivers is a lock-free copy of len(receivers). It is written only
+	// under mu, at every site that mutates that map, and read without mu by the
+	// send side. A publisher may skip the lock entirely when it reads zero: there
+	// is nobody to fan out to, and sendLocked has no other effect.
+	//
+	// Only one direction of error is safe. Over-reporting is free — the publisher
+	// takes the lock and finds nothing, which is what it did before this field
+	// existed. Under-reporting loses a value permanently, because a conflated bus
+	// has no retry: the next send for that key coalesces into a slot the
+	// subscriber was never told had been skipped. That asymmetry is why the count
+	// is *derived* from len(receivers) by syncLiveLocked rather than incremented
+	// and decremented — a derived value cannot drift below the truth.
+	//
+	// Closedness is deliberately folded into this one field rather than mirrored
+	// into a second atomic: Sender.Close and Hub.Close store sendPoisoned, and no
+	// later write clears it. That is what lets txClosed stay a plain bool with a
+	// single access discipline — it is read only under mu, on the path the poison
+	// guarantees a closed hub takes.
+	liveReceivers atomic.Int64
+
+	// forTestingBeforeSendLock, if non-nil, runs on every send path that is about
+	// to take mu — Send, TrySend and SendContext — after SendContext has taken
+	// ctx's Done channel and before the lock is acquired. A test can therefore
+	// land a cancellation in the window where the send is waiting for the lock,
+	// and can count lock acquisitions from the send side. The send-side twin of
+	// forTestingBeforeRecvLock. nil in production.
 	//
 	// Unlike the receiver seams, this one is hub-wide and is read outside mu —
 	// it has to be, since the window it opens is the wait for mu itself. It is
@@ -125,6 +167,24 @@ type shared[K comparable, V any] struct {
 	// a multi-sender test must discriminate inside the func, not by arming.
 	forTestingBeforeSendLock func()
 }
+
+// syncLiveLocked refreshes the lock-free receiver count from the map that owns
+// the truth. Call it at every site that mutates s.receivers. Caller holds s.mu.
+//
+// The early return is load-bearing, not defensive: a Receiver.Close after a
+// Sender.Close deregisters through here, and without the guard it would write a
+// zero over the poison and hand a closed hub back to the fast path.
+func (s *shared[K, V]) syncLiveLocked() {
+	if s.liveReceivers.Load() == sendPoisoned {
+		return
+	}
+	s.liveReceivers.Store(int64(len(s.receivers)))
+}
+
+// poisonLiveLocked retires the send fast path for the life of the hub, so every
+// later send reaches sendLocked and is answered from txClosed. Caller holds
+// s.mu.
+func (s *shared[K, V]) poisonLiveLocked() { s.liveReceivers.Store(sendPoisoned) }
 
 // Hub is the construction handle for a conflate pipeline.
 type Hub[K comparable, V any] struct {
@@ -260,6 +320,7 @@ func (h *Hub[K, V]) receiver(opts []ReceiverOption[K, V]) *Receiver[K, V] {
 		rx.done.Close()
 	} else {
 		h.s.receivers[rx] = struct{}{}
+		h.s.syncLiveLocked()
 	}
 	h.s.mu.Unlock()
 	return rx
@@ -278,6 +339,7 @@ func (h *Hub[K, V]) Close() {
 	}
 	s.hubClosed = true
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.done.Close()
 	}
@@ -287,8 +349,31 @@ func (h *Hub[K, V]) Close() {
 // Send publishes v under key k to every receiver. Never blocks. For a receiver
 // that already has k pending, the caller's [Merge] coalesces into that slot;
 // otherwise k is appended at the back of the receiver's queue.
+//
+// A Send to a hub with no live receiver does nothing and returns nil. That has
+// always been the answer — there is nobody to fan out to — but it is now
+// reached without taking the bus lock at all, so a hot producer pays nothing
+// for a bus nobody is reading. Only the cost changes, never the result.
+//
+// This makes one existing requirement load-bearing in a place a reader would
+// not think to look. A subscriber must call [Hub.Receiver] *before* it takes
+// its own snapshot of the producer's state, never after: a value published in
+// the gap reaches no receiver, and conflate has no replay to recover it. The
+// requirement is not new — a receiver has always observed only what was sent
+// after it was created — but a publisher that skips the lock cannot notice a
+// subscriber that arrives late, so getting the order wrong loses the value
+// permanently rather than merely racily.
 func (tx *Sender[K, V]) Send(k K, v V) error {
 	s := tx.s
+	// Zero means no receiver *and* an open send side, since close poisons the
+	// count. There is nothing to fan out to and no other answer to give, so the
+	// hub-wide lock is pure cost here.
+	if s.liveReceivers.Load() == 0 {
+		return nil
+	}
+	if s.forTestingBeforeSendLock != nil {
+		s.forTestingBeforeSendLock()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	_, err := s.sendLocked(nil, k, v)
@@ -335,11 +420,18 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 
 // SendContext behaves like Send, but reports a cancelled ctx instead of
 // publishing. Send never blocks, so ctx is consulted exactly once — there is
-// no parked state in which a cancellation could arrive — and never gates the
-// call on anything but the bus lock.
+// no parked state in which a cancellation could arrive — and gates the call on
+// nothing beyond reaching the point where the send is resolved.
 //
-// That single check is made where the send is *resolved*, under s.mu, not on
-// entry. So a ctx that was live when SendContext was called but is cancelled
+// That single check is made where the send is *resolved*, not on entry. A live
+// ctx on a hub with no live receiver resolves at the lock-free receiver-count
+// read, with nothing to publish and nothing to report. Every other send —
+// including every cancelled one — resolves under s.mu, so that txClosed and
+// ctxDone are read from one consistent view and closed > cancelled is derived
+// rather than assembled from two reads taken at different moments. The rest of
+// this comment is about that path.
+//
+// So a ctx that was live when SendContext was called but is cancelled
 // by the time this send reaches the front of the lock reports ctx.Err() and
 // publishes nothing. This is deliberate: a caller passing a context is asking
 // for the publish to be bounded by it, and the wait for s.mu is real work —
@@ -366,6 +458,27 @@ func (tx *Sender[K, V]) TrySend(k K, v V) error { return tx.Send(k, v) }
 func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	s := tx.s
 	ctxDone := ctx.Done()
+	// The no-receiver fast path. It answers only nil — never an error — and that
+	// restriction is what keeps it correct.
+	//
+	// A live ctx and a zero count resolve the whole call at the load: there is
+	// nobody to fan out to, and a close landing afterwards is a close that raced
+	// the send, exactly as one landing after the lock is below.
+	//
+	// A cancelled ctx cannot be answered here, because the count and ctxDone are
+	// read at two different moments. A Sender.Close landing between them would
+	// make ctx.Err() correct at neither: at the load the answer is nil, and by
+	// the select the sender is closed and ErrClosed outranks the cancellation.
+	// Falling through costs a cancelled send one lock acquisition and resolves
+	// txClosed and ctxDone from a single consistent view, which is the only
+	// place closed > cancelled can be derived rather than stitched together.
+	if s.liveReceivers.Load() == 0 {
+		select {
+		case <-ctxDone:
+		default:
+			return nil
+		}
+	}
 	if s.forTestingBeforeSendLock != nil {
 		s.forTestingBeforeSendLock()
 	}
@@ -397,6 +510,7 @@ func (tx *Sender[K, V]) Close() {
 		return
 	}
 	s.txClosed = true
+	s.poisonLiveLocked()
 	for rx := range s.receivers {
 		rx.signalLocked()
 	}
@@ -476,6 +590,7 @@ func (rx *Receiver[K, V]) drainedLocked() bool {
 // [Receiver.Close]. Caller holds s.mu.
 func (rx *Receiver[K, V]) deregisterLocked() {
 	delete(rx.s.receivers, rx)
+	rx.s.syncLiveLocked()
 }
 
 // signalLocked wakes this receiver's parked readers, if any. Caller holds s.mu.
