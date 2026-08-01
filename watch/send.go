@@ -77,3 +77,22 @@ func (rx *Receiver[K, V]) signalLocked() {
 	close(rx.notify)
 	rx.notify = make(chan struct{})
 }
+
+// Close closes the sender. A receiver holding an unread value reads it once
+// more before subsequent reads return [gobus.ErrClosed]; a receiver already
+// caught up sees ErrClosed at once. Further sends return ErrClosed.
+// Idempotent.
+//
+// Do not call it concurrently with an active Send from another goroutine.
+func (tx *Sender[K, V]) Close() {
+	s := tx.s
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.txClosed {
+		return
+	}
+	s.txClosed = true
+	for rx := range s.receivers {
+		rx.signalLocked()
+	}
+}

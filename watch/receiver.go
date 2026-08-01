@@ -72,6 +72,13 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 	if rx.done.IsClosed() {
 		return zero, gobus.ErrClosed
 	}
+	// Drained-and-closed is terminal however it is observed, so this verdict
+	// carries the same tear-down the blocking path's does, under the lock that
+	// decided it.
+	if rx.drainedLocked() {
+		rx.s.deregisterLocked(rx)
+		return zero, gobus.ErrClosed
+	}
 	if rx.unreadLocked() {
 		return rx.takeLocked(), nil
 	}
