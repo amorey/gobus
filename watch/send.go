@@ -1,6 +1,10 @@
 package watch
 
-import "github.com/amorey/gobus"
+import (
+	"context"
+
+	"github.com/amorey/gobus"
+)
 
 // Send publishes v as the value of k to every receiver watching k. Never
 // blocks. A Send for a key nobody watches is discarded: there is no receiver
@@ -95,4 +99,38 @@ func (tx *Sender[K, V]) Close() {
 	for rx := range s.receivers {
 		rx.signalLocked()
 	}
+}
+
+// SendContext behaves like Send but reports a cancelled ctx instead of
+// publishing. Send never blocks, so ctx is consulted once — at the point the
+// send is resolved, under the bus lock, rather than on entry. A cancellation
+// landing while the call waits for that lock is therefore honoured, and
+// nothing is published for a ctx that has since expired.
+//
+// Precedence is closed > cancelled: a sender already closed reports
+// [gobus.ErrClosed] even for an already-cancelled ctx, since that is the
+// durable answer and a retry with a fresh context would only return it again.
+//
+// Only ctx's Done channel is read under the bus lock; ctx.Err() is called
+// after it is released, so a context implementation that locks cannot deadlock
+// against another goroutine's Send or Close. See sendLocked.
+func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
+	s := tx.s
+	ctxDone := ctx.Done()
+	if s.forTestingBeforeSendLock != nil {
+		s.forTestingBeforeSendLock()
+	}
+	// The locked section is a closure so the unlock is deferred: sendLocked
+	// runs the caller's Accept, and a panic out of it must still release s.mu
+	// or a recovering caller finds the whole hub wedged. Resolving ctx.Err()
+	// has to happen after the unlock, which rules out deferring in the body.
+	cancelled, err := func() (bool, error) {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		return s.sendLocked(ctxDone, k, v)
+	}()
+	if cancelled {
+		return ctx.Err()
+	}
+	return err
 }

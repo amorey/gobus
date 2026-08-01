@@ -192,3 +192,16 @@ func (rx *Receiver[K, V]) recvLoop(ctx context.Context) (gobus.Event[K, V], erro
 		}
 	}
 }
+
+// RecvContext blocks like Recv but returns ctx.Err() if ctx is cancelled
+// first. Cancellation does not close this receiver.
+//
+// It implements the closed > cancelled > value precedence documented on
+// [gobus.Receiver] — including that a cancelled read never consumes the value
+// it declined, and that reaching ctx.Err() neither closes nor deregisters the
+// receiver. What is watch-specific is the cost of ignoring the latter: an
+// abandoned handle holds its key against the hub for the hub's lifetime.
+// `defer rx.Close()` covers it, as it does for any abandoned receiver.
+func (rx *Receiver[K, V]) RecvContext(ctx context.Context) (gobus.Event[K, V], error) {
+	return rx.recvLoop(ctx)
+}

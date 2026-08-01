@@ -18,6 +18,14 @@ type shared[K comparable, V any] struct {
 
 	txClosed  bool
 	hubClosed bool
+
+	// forTestingBeforeSendLock, if non-nil, runs on every send path about to
+	// take mu, after SendContext has taken ctx's Done channel and before the
+	// lock is acquired. A test can therefore land a cancellation in the window
+	// where the send is waiting for the lock. Hub-wide and read outside mu — it
+	// has to be, since the window it opens is the wait for mu itself — so arm
+	// it only while no send is in flight. nil in production.
+	forTestingBeforeSendLock func()
 }
 
 // registerLocked adds rx to both maps. Caller holds s.mu.
