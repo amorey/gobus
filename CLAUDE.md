@@ -12,7 +12,8 @@ here: on a gobus every value travels under a **key**, and each bus type defines
 its own policy for what happens when several values for the same key are in
 flight at once. Requires Go 1.21+.
 
-Currently one bus type: `conflate`.
+Currently two bus types: `conflate` (keyed event bus) and `watch` (keyed
+state bus).
 
 See `README.md` for the full public API reference (constructors, methods,
 semantics tables, error meanings). When changing public behavior, update
@@ -25,6 +26,7 @@ go test ./...                        # all tests
 go test -race ./...                  # what CI runs
 go test -run TestAnnihilation ./conflate   # a single test
 go run ./conflate/examples/recv      # runnable examples
+go run ./watch/examples/chan
 ```
 
 Lint gates, all of which CI enforces separately:
@@ -69,10 +71,19 @@ environment issue, not a code issue, and does not affect CI (Linux).
   `conflate` never returns `ErrFull`; it is reserved for future bounded buses.
 - `conflate/` — keyed latest-value fan-out. `New` returns `*Hub[K, V]`; handles
   come from `hub.Sender()` and `hub.Receiver(opts...)`.
+- `watch/` — keyed latest-value **state** bus. One receiver watches one key,
+  seeded by the caller at `hub.Watch(k, initial)`; `Receiver.Close` is the
+  unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
+  evaluated per receiver against that receiver's own slot. See
+  `docs/adr/2026-08-01-watch-keyed-state-bus.md` for why it exists and what was
+  rejected on the way.
 - `internal/buscore/` — shared building blocks, not part of the public API.
-  Currently `CloseOnce` (atomic flag + done channel), used for the lock-free
-  closed pre-check on every receive path. Prefer extending `buscore` over
-  duplicating select/close logic across bus packages.
+  `CloseOnce` (atomic flag + done channel), used for the lock-free closed
+  pre-check on every receive path, and `LiveCount` (the poisoned send-fast-path
+  counter both buses gate `Send` on). Prefer extending `buscore` over
+  duplicating select/close logic across bus packages — `LiveCount` exists
+  because the second bus package would otherwise have copied the poison
+  invariant and its rationale.
 
 ## Architecture
 
@@ -183,11 +194,21 @@ itself so a long-lived hub doesn't pin drained receivers.
 
 Mirror `gochan`'s conventions unless there's a reason not to.
 
-- Policy is explicit, never implicit. `New`, `WithKeyFilter` and `WithMerge`
-  panic on a nil function rather than substituting a default — the coalescing
-  policy is the point of the bus. A nil option passed to `Receiver` panics too.
+- Policy is explicit, never implicit. A nil *function* passed to an option
+  constructor panics rather than being replaced by a default, and a nil
+  *option* passed to a constructor panics too (`conflate.Hub.Receiver`,
+  `watch.New`). `conflate.New` goes further and requires its `Merge`, because
+  coalescing is the point of that bus; `watch` lets `Accept` be omitted,
+  because a state bus has a meaningful identity rule (last-writer-wins) and
+  omitting the option is then a statement rather than an oversight. Supplying
+  a nil one is still a panic.
 - Per-receiver options are **methods on the Hub** (`hub.WithKeyFilter(...)`),
-  not package-level functions. This is forced by generics: package-level
+  not package-level functions. Hub-*construction* options cannot be, since
+  there is no hub yet — `watch.WithAccept` is package-level for that reason,
+  and it works without type-argument noise only because `watch.Option[V]`
+  carries `V` alone. Adding a `K`-dependent hub option would force both type
+  arguments at every call site; don't, without meaning to. This is forced by
+  generics: package-level
   `WithKeyFilter[K, V](func(K) bool)` cannot infer `V`, and
   `WithMerge[K, V](Merge[V])` cannot infer `K`, so callers would have to spell
   out both type arguments at every call site. Taking the option off the hub

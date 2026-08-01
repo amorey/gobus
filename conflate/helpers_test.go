@@ -22,5 +22,15 @@ func (h *Hub[K, V]) forTestingReceiverCount() int {
 func (h *Hub[K, V]) forTestingLiveReceivers() int64 {
 	h.s.mu.Lock()
 	defer h.s.mu.Unlock()
-	return h.s.liveReceivers.Load()
+	return h.s.live.Load()
+}
+
+// forTestingLivePoisoned reports whether the send fast path has been retired
+// for the life of the hub. The sentinel value belongs to buscore; what this
+// package's tests care about is that a closed hub can never read as idle
+// again, whichever close path got there.
+func (h *Hub[K, V]) forTestingLivePoisoned() bool {
+	h.s.mu.Lock()
+	defer h.s.mu.Unlock()
+	return h.s.live.Load() < 0
 }
