@@ -21,6 +21,7 @@ import (
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/conflate"
+	"github.com/amorey/gobus/watch"
 )
 
 // architecture is one bus type under test. newPair returns a live sender and
@@ -40,6 +41,20 @@ var architectures = []architecture{
 			h := conflate.New[int](func(_, next int) (int, bool) { return next, true })
 			t.Cleanup(h.Close)
 			return h.Sender(), h.Receiver()
+		},
+	},
+	{
+		name: "watch",
+		newPair: func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
+			t.Helper()
+			// No Accept: latest-wins, the simplest policy, which keeps these
+			// tests about precedence. A watch receiver is bound to one key, so
+			// the row watches the key the suite sends to. Watch does not
+			// deliver its seed, so the receiver starts with nothing unread and
+			// the suite's first TryRecv sees ErrEmpty as it does for conflate.
+			h := watch.New[int, int]()
+			t.Cleanup(h.Close)
+			return h.Sender(), h.Watch(1, 0)
 		},
 	},
 }

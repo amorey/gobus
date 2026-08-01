@@ -95,6 +95,46 @@ Take the snapshot before registering and any value published in the gap reaches 
 
 [Recv Example](./conflate/examples/recv/main.go) · [Chan Example](./conflate/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
+### Watch
+
+Watch is a single-producer, multi-consumer keyed **state** bus. Where `conflate` streams events, `watch` distributes the *current value* of a key: each `Receiver` watches exactly one key and holds **one slot** for it, so a slow consumer skips to the current value rather than replaying what it missed.
+
+A receiver is created by `Hub.Watch`, which is also where its baseline comes from — the caller passes the value it has just read, and `Receiver.Close()` is the matching unwatch.
+
+```go
+hub := watch.New[ObjectID](watch.WithAccept(func(prev, next Stamped) bool {
+	return next.Seq > prev.Seq
+}))
+defer hub.Close()
+
+// Read your state and register in one critical section: Watch calls no
+// caller code, so it is safe under your own lock.
+q.mu.Lock()
+cur := q.current(id)
+rx := hub.Watch(id, cur)
+q.mu.Unlock()
+defer rx.Close()
+
+for ev := range rx.Chan() {
+	use(ev.Value)
+}
+```
+
+Three things distinguish it from `conflate`:
+
+**Registration is the snapshot.** `Watch` takes the value you have just read and never hands it back — it is the baseline, not a delivery. Because `Watch` calls no caller code, you can read your state and register in one critical section, which removes the register-before-read ordering rule `conflate` imposes. This is the **opposite** of `gochan/watch`, whose registration deliberately does not snapshot; don't carry that rule across.
+
+**`Accept` decides which value wins.** Instead of a `Merge`, `watch` takes an optional `Accept func(prev, next V) bool`. It runs under the bus lock once for each receiver watching the key, against *that receiver's own current value* — so one value can be new for a receiver that subscribed early and stale for one that subscribed late. This is what makes the settled value independent of which of two concurrent `Send` calls takes the lock first, provided your rule is a strict order over `V`. Without the option every value is accepted, which is last-writer-wins.
+
+`Accept` is caller code running under the bus lock. It must not call back into the hub, and it must not take any lock a caller may hold while calling `Watch`, `Send` or `Close` — `Watch` is expressly safe under a producer's lock, so an `Accept` that takes that same lock inverts the two orders and deadlocks. Reading its two arguments and nothing else is always safe.
+
+**One key per receiver.** There is no `Unwatch` and no key set: the constraint is structural, which is what removes the questions a mutable key set raises. A consumer watching N keys therefore holds N receivers and, if it uses `Chan()`, N goroutines — so `watch` is deliberately unsuited to wide subscriptions. A wide change-stream consumer wants `conflate`, which has the annihilation that a create-then-delete pair needs.
+
+`Send` for a key nobody watches is dropped, and nothing is retained: there is no receiver and therefore no buffer. `Send` on a hub with no receiver at all returns `nil` without taking the bus lock, exactly as `conflate` does.
+
+[Docs](https://pkg.go.dev/github.com/amorey/gobus/watch)
+
+
 ## Design notes
 
 ### Common interfaces
@@ -174,18 +214,22 @@ Sender-close is the one termination that does not pre-empt a pending event: it i
 | ------------------ | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `Sender.Close()`   | Graceful end-of-stream. Each receiver drains its pending per-key values once, then sees `ErrClosed` / a closed `Chan`.                    |
 | `Receiver.Close()` | This handle only. Other receivers and the sender keep running; this handle's pending values are abandoned and its `Chan` feeder shuts down. |
-| `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Receiver()` calls return pre-closed handles.                  |
+| `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Receiver()` / `Hub.Watch()` calls return pre-closed handles.  |
 
 All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from another goroutine — it inherits the sender's close discipline.
 
-A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain deregisters itself from the hub, so a long-lived hub doesn't pin abandoned receivers.
+A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain deregisters itself from the hub, so a long-lived hub doesn't pin abandoned receivers. On `watch` that tear-down also releases the key's state, so a key costs nothing once its last watcher has gone by either exit path.
+
+On `watch`, `Sender.Close()` drains at most one value per receiver — its slot holds one — and `Hub.Watch` after a `Sender.Close` returns a *live* handle that holds nothing unread, so its first read is terminal. Only `Hub.Close` returns pre-closed handles.
 
 ### Thread safety
 
-`conflate`'s `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock. `Send` first reads a lock-free receiver count and takes that lock only when a receiver is registered. A `Receiver` is intended for a single consumer goroutine — it owns an insertion-ordered queue that is meant to be popped by one reader.
+Both packages' `Sender` types are safe to share across goroutines. `conflate`'s `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock. `Send` first reads a lock-free receiver count and takes that lock only when a receiver is registered. A `Receiver` is intended for a single consumer goroutine — it owns an insertion-ordered queue that is meant to be popped by one reader.
 
 ### Chan support
 
 `Chan()` returns a per-receiver **private** channel fed by a per-receiver goroutine, as in `gochan`'s `broadcast` and `watch`. `Receiver.Close()` closes it; `Sender.Close()` also closes it once the feeder has drained. Always `Close` the receiver when you stop reading or the feeder will leak.
 
 The channel is unbuffered on purpose: coalescing continues in the receiver's per-key slots while the consumer is busy, so a fast publisher produces no backlog beyond the live key set. One caveat — an event already handed to the feeder has left the receiver's slots, so a `Send` for that key while the feeder is parked on delivery enqueues the key afresh rather than coalescing into the in-flight event.
+
+`watch`'s feeder differs: it marks a value read only once the consumer takes it, so a newer value arriving mid-delivery makes the feeder re-snapshot instead of handing over the superseded one. That is a latency property, not a guarantee — once the feeder has committed to a delivery both arms of its select are ready and Go chooses at random, so a superseded value is sometimes delivered with the newer one immediately behind it. What holds is that values arrive in order and that a consumer which keeps reading converges on the current value.
