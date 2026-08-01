@@ -20,10 +20,10 @@ func (h *Hub[K, V]) forTestingKeyCount() int {
 
 // forTestingLiveReceivers returns the lock-free count that gates the send fast
 // path. It takes s.mu so a test reads it and len(s.receivers) as one
-// consistent pair; the fast path itself reads the field without the lock,
-// which is the whole point of the field.
+// consistent pair; the fast path itself reads the count without the lock,
+// which is the whole point of it.
 func (h *Hub[K, V]) forTestingLiveReceivers() int64 {
 	h.s.mu.Lock()
 	defer h.s.mu.Unlock()
-	return h.s.liveReceivers.Load()
+	return h.s.live.Load()
 }

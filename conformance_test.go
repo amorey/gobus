@@ -26,14 +26,23 @@ import (
 
 // architecture is one bus type under test. newPair returns a live sender and
 // receiver on a fresh hub, already registered with each other.
+//
+// key is the key the suite must publish under for that receiver to see the
+// value. It exists because a bus may bind a receiver to a single key at
+// registration — watch does — and a suite that published elsewhere would make
+// the negative assertions pass vacuously against a bus that simply delivers
+// nothing. Every test body sends to a.key rather than a literal, so a new case
+// cannot drift out from under a single-key architecture.
 type architecture struct {
 	name    string
+	key     int
 	newPair func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int])
 }
 
 var architectures = []architecture{
 	{
 		name: "conflate",
+		key:  1,
 		newPair: func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
 			t.Helper()
 			// latest-wins, never annihilating: the simplest policy that keeps
@@ -45,13 +54,15 @@ var architectures = []architecture{
 	},
 	{
 		name: "watch",
+		key:  1,
 		newPair: func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
 			t.Helper()
 			// No Accept: latest-wins, the simplest policy, which keeps these
-			// tests about precedence. A watch receiver is bound to one key, so
-			// the row watches the key the suite sends to. Watch does not
-			// deliver its seed, so the receiver starts with nothing unread and
-			// the suite's first TryRecv sees ErrEmpty as it does for conflate.
+			// tests about precedence. A watch receiver is bound to one key at
+			// registration, which is what architecture.key exists to state.
+			// Watch does not deliver its seed, so the receiver starts with
+			// nothing unread and the suite's first TryRecv sees ErrEmpty as it
+			// does for conflate.
 			h := watch.New[int, int]()
 			t.Cleanup(h.Close)
 			return h.Sender(), h.Watch(1, 0)
@@ -70,13 +81,13 @@ func TestSendContextPrecedenceConformance(t *testing.T) {
 				tx.Close()
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
-				assert.ErrorIs(t, tx.SendContext(ctx, 1, 10), gobus.ErrClosed)
+				assert.ErrorIs(t, tx.SendContext(ctx, a.key, 10), gobus.ErrClosed)
 			})
 			t.Run("cancelled on a live sender", func(t *testing.T) {
 				tx, rx := a.newPair(t)
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
-				require.ErrorIs(t, tx.SendContext(ctx, 1, 10), context.Canceled)
+				require.ErrorIs(t, tx.SendContext(ctx, a.key, 10), context.Canceled)
 				_, err := rx.TryRecv()
 				assert.ErrorIs(t, err, gobus.ErrEmpty, "a cancelled send published anyway")
 			})
@@ -126,16 +137,16 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 				// returns, so this is deterministic — and a bus that did tear
 				// the handle down fails here immediately instead of blocking
 				// until the package timeout.
-				require.NoError(t, tx.Send(1, 10))
+				require.NoError(t, tx.Send(a.key, 10))
 				ev, err := rx.TryRecv()
 				require.NoError(t, err, "cancellation closed the receiver")
-				assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 10}, ev)
+				assert.Equal(t, gobus.Event[int, int]{Key: a.key, Value: 10}, ev)
 			})
 			t.Run("cancelled beats a ready value", func(t *testing.T) {
 				// The rank that keeps cancellation observable under load, and
 				// the no-discard rule that bounds its cost.
 				tx, rx := a.newPair(t)
-				require.NoError(t, tx.Send(1, 10))
+				require.NoError(t, tx.Send(a.key, 10))
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 				_, err := rx.RecvContext(ctx)
@@ -143,7 +154,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 
 				ev, err := rx.TryRecv()
 				require.NoError(t, err, "a cancelled receive consumed the value")
-				assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 10}, ev)
+				assert.Equal(t, gobus.Event[int, int]{Key: a.key, Value: 10}, ev)
 			})
 		})
 	}
@@ -161,13 +172,13 @@ func TestSenderCloseDrainsBeforeClosedConformance(t *testing.T) {
 	for _, a := range architectures {
 		t.Run(a.name, func(t *testing.T) {
 			tx, rx := a.newPair(t)
-			require.NoError(t, tx.Send(1, 42))
+			require.NoError(t, tx.Send(a.key, 42))
 			tx.Close()
 
 			// The value survives the close that raced it.
 			ev, err := rx.Recv()
 			require.NoError(t, err, "sender-close pre-empted a buffered value")
-			assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 42}, ev)
+			assert.Equal(t, gobus.Event[int, int]{Key: a.key, Value: 42}, ev)
 
 			// ...and only then is the stream terminal.
 			_, err = rx.Recv()

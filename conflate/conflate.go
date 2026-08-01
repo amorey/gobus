@@ -76,22 +76,10 @@ import (
 	"container/list"
 	"context"
 	"sync"
-	"sync/atomic"
 
 	"github.com/amorey/gobus"
 	"github.com/amorey/gobus/internal/buscore"
 )
-
-// sendPoisoned is the value liveReceivers holds once the send side has closed.
-// It is not a count: it only has to be non-zero, so that a closed hub always
-// takes the locked path, where sendLocked reads txClosed and reports ErrClosed.
-//
-// Without it, Hub.Close emptying s.receivers — or the last receiver closing
-// after Sender.Close — would leave a zero count on a closed hub, and the send
-// fast path would answer nil where ErrClosed is the durable answer.
-//
-// The type is explicit so the comparison and the store need no conversion.
-const sendPoisoned int64 = -1
 
 // Merge combines an undelivered pending value with a newly sent value for the
 // same key. It is invoked only when the key already has a pending (not yet
@@ -128,25 +116,13 @@ type shared[K comparable, V any] struct {
 	txClosed  bool
 	hubClosed bool
 
-	// liveReceivers is a lock-free copy of len(receivers). It is written only
-	// under mu, at every site that mutates that map, and read without mu by the
-	// send side. A publisher may skip the lock entirely when it reads zero: there
-	// is nobody to fan out to, and sendLocked has no other effect.
-	//
-	// Only one direction of error is safe. Over-reporting is free — the publisher
-	// takes the lock and finds nothing, which is what it did before this field
-	// existed. Under-reporting loses a value permanently, because a conflated bus
-	// has no retry: the next send for that key coalesces into a slot the
-	// subscriber was never told had been skipped. That asymmetry is why the count
-	// is *derived* from len(receivers) by syncLiveLocked rather than incremented
-	// and decremented — a derived value cannot drift below the truth.
-	//
-	// Closedness is deliberately folded into this one field rather than mirrored
-	// into a second atomic: Sender.Close and Hub.Close store sendPoisoned, and no
-	// later write clears it. That is what lets txClosed stay a plain bool with a
-	// single access discipline — it is read only under mu, on the path the poison
-	// guarantees a closed hub takes.
-	liveReceivers atomic.Int64
+	// live is the lock-free receiver count gating the send fast path. It is
+	// synced only under mu, at every site that mutates s.receivers, and read
+	// without mu by the send side. See [buscore.LiveCount] for why it is
+	// derived rather than incremented, and why closedness is folded into it
+	// instead of mirrored into a second atomic — that is what lets txClosed
+	// stay a plain bool read only under mu.
+	live buscore.LiveCount
 
 	// forTestingBeforeSendLock, if non-nil, runs on every send path that is about
 	// to take mu — Send, TrySend and SendContext — after SendContext has taken
@@ -174,17 +150,12 @@ type shared[K comparable, V any] struct {
 // The early return is load-bearing, not defensive: a Receiver.Close after a
 // Sender.Close deregisters through here, and without the guard it would write a
 // zero over the poison and hand a closed hub back to the fast path.
-func (s *shared[K, V]) syncLiveLocked() {
-	if s.liveReceivers.Load() == sendPoisoned {
-		return
-	}
-	s.liveReceivers.Store(int64(len(s.receivers)))
-}
+func (s *shared[K, V]) syncLiveLocked() { s.live.Sync(len(s.receivers)) }
 
 // poisonLiveLocked retires the send fast path for the life of the hub, so every
 // later send reaches sendLocked and is answered from txClosed. Caller holds
 // s.mu.
-func (s *shared[K, V]) poisonLiveLocked() { s.liveReceivers.Store(sendPoisoned) }
+func (s *shared[K, V]) poisonLiveLocked() { s.live.Poison() }
 
 // Hub is the construction handle for a conflate pipeline.
 type Hub[K comparable, V any] struct {
@@ -368,7 +339,7 @@ func (tx *Sender[K, V]) Send(k K, v V) error {
 	// Zero means no receiver *and* an open send side, since close poisons the
 	// count. There is nothing to fan out to and no other answer to give, so the
 	// hub-wide lock is pure cost here.
-	if s.liveReceivers.Load() == 0 {
+	if s.live.Idle() {
 		return nil
 	}
 	if s.forTestingBeforeSendLock != nil {
@@ -472,7 +443,7 @@ func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 	// Falling through costs a cancelled send one lock acquisition and resolves
 	// txClosed and ctxDone from a single consistent view, which is the only
 	// place closed > cancelled can be derived rather than stitched together.
-	if s.liveReceivers.Load() == 0 {
+	if s.live.Idle() {
 		select {
 		case <-ctxDone:
 		default:

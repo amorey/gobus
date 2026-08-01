@@ -1329,7 +1329,7 @@ func TestLiveCountTracksTheReceiverSet(t *testing.T) {
 	// longer matches, and must not: a zero on a closed hub would hand the fast
 	// path an ErrClosed to answer as nil.
 	tx.Close()
-	require.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
+	require.True(t, h.forTestingLivePoisoned())
 
 	// A drain to terminal ErrClosed deregisters the receiver itself, which is a
 	// different route into deregisterLocked than Receiver.Close — and the one
@@ -1338,7 +1338,7 @@ func TestLiveCountTracksTheReceiverSet(t *testing.T) {
 	_, err := rx2.Recv()
 	require.ErrorIs(t, err, gobus.ErrClosed)
 	require.Zero(t, h.forTestingReceiverCount())
-	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers(), "deregistration cleared the poison")
+	assert.True(t, h.forTestingLivePoisoned(), "deregistration cleared the poison")
 }
 
 // TestHubCloseAlsoPoisonsTheCount pins the second close path. Hub.Close empties
@@ -1348,7 +1348,7 @@ func TestHubCloseAlsoPoisonsTheCount(t *testing.T) {
 	h := New[int](latestWins)
 	h.Receiver()
 	h.Close()
-	assert.Equal(t, int64(sendPoisoned), h.forTestingLiveReceivers())
+	assert.True(t, h.forTestingLivePoisoned())
 }
 
 // countSendLocks arms the hub-wide send seam with a lock counter and returns

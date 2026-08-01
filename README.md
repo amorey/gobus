@@ -224,7 +224,9 @@ On `watch`, `Sender.Close()` drains at most one value per receiver — its slot 
 
 ### Thread safety
 
-Both packages' `Sender` types are safe to share across goroutines. `conflate`'s `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock. `Send` first reads a lock-free receiver count and takes that lock only when a receiver is registered. A `Receiver` is intended for a single consumer goroutine — it owns an insertion-ordered queue that is meant to be popped by one reader.
+Both packages' `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock, and `Send` first reads a lock-free receiver count so it takes that lock only when a receiver is registered.
+
+A `Receiver` is intended for a single consumer goroutine in both. `conflate` relies on it — the receiver owns an insertion-ordered queue meant to be popped by one reader. `watch` treats it as intent rather than invariant: a receiver using `Chan()` genuinely has two readers (the feeder and any direct `TryRecv`), so its read position lives under the hub lock rather than in the reading goroutine.
 
 ### Chan support
 
