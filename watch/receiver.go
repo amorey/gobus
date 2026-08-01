@@ -41,6 +41,15 @@ type Receiver[K comparable, V any] struct {
 	// production.
 	forTestingBeforeRecvLock    func()
 	forTestingBeforeTryRecvLock func()
+
+	// forTestingFeederBeforeLock, forTestingFeederParked and
+	// forTestingFeederExit, if non-nil, are invoked by the Chan feeder:
+	// respectively after its lock-free closed check and before taking s.mu,
+	// after it snapshots a value and before it enters the delivery select, and
+	// on the way out just before it closes the channel. nil in production.
+	forTestingFeederBeforeLock func()
+	forTestingFeederParked     func()
+	forTestingFeederExit       func()
 }
 
 // unreadLocked reports whether the slot holds a value this receiver has not
