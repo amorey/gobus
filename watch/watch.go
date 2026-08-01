@@ -198,6 +198,12 @@ func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
 // Close is hard tear-down: the sender and every live receiver are closed
 // immediately, with no final drain. Use [Sender.Close] for the soft path.
 // Future [Hub.Watch] calls return pre-closed handles. Idempotent.
+//
+// "No drain" is a statement about the reading methods, which report
+// [gobus.ErrClosed] at once. A [Receiver.Chan] consumer can still receive one
+// value after Close returns: if the feeder had already committed to a delivery
+// the close makes both arms of its select ready, and Go picks between ready
+// arms at random. The channel closes immediately after. See [Receiver.Chan].
 func (h *Hub[K, V]) Close() {
 	s := h.s
 	s.mu.Lock()
@@ -584,11 +590,17 @@ func (rx *Receiver[K, V]) recvLoop(ctx context.Context) (gobus.Event[K, V], erro
 // sender/hub-close with nothing left to drain.
 //
 // Reading it is not a guarantee that every value read is current at the moment
-// it is read. Once the feeder has committed to a delivery, a newer value
-// arriving makes both arms of its select ready, and Go chooses between ready
-// arms at random — so a superseded value is sometimes delivered, with the
-// newer one immediately behind it. What holds is that values arrive in order
-// and that a consumer which keeps reading converges on the current value.
+// it is read. Once the feeder has committed to a delivery, anything that makes
+// its select's other arms ready is racing that delivery, and Go chooses
+// between ready arms at random. Two consequences:
+//
+//   - A newer value arriving can lose the race, so a superseded value is
+//     sometimes delivered, with the newer one immediately behind it. Values
+//     still arrive in order, and a consumer that keeps reading converges on
+//     the current value.
+//   - A [Receiver.Close] or [Hub.Close] can lose it too, so one value can
+//     still be received after either returns, even though both are documented
+//     as abandoning what is unread. The channel closes immediately after.
 //
 // Abandoning the channel without calling [Receiver.Close] pins the feeder
 // goroutine — it parks forever waiting for the next value. Always Close the
@@ -693,6 +705,9 @@ func (rx *Receiver[K, V]) feed() {
 // Close is the unwatch: it closes this handle, discards any unread value and
 // drops the key from the hub once no other receiver watches it. Other
 // receivers and the sender are unaffected. Idempotent.
+//
+// A [Receiver.Chan] consumer can still receive one value after Close returns;
+// see Chan for why.
 func (rx *Receiver[K, V]) Close() {
 	// Close under mu so a concurrent read that acquired mu first cannot hand
 	// back a value to a now-closed receiver: readers re-check rx.done after

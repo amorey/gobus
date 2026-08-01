@@ -22,22 +22,45 @@ const poisoned = -1
 // its closed flag a plain bool with a single access discipline, read only
 // under the bus lock, on the path the poison guarantees a closed bus takes.
 //
-// Every method is safe to call concurrently, but Sync is meant to be called
-// under the bus lock, at every site that mutates the receiver map.
+// Every method is safe to call concurrently, including Sync against a
+// concurrent Poison — see Sync for why that costs a compare-and-swap. Buses
+// call Sync under their own lock anyway, at every site that mutates the
+// receiver map, but the poison invariant does not depend on their doing so.
 type LiveCount struct {
 	n atomic.Int64
+
+	// forTestingBeforeStore, if non-nil, runs inside Sync between reading the
+	// current value and writing the new one, so a test can land a Poison in
+	// that window without relying on timing. nil in production.
+	forTestingBeforeStore func()
 }
 
 // Sync refreshes the count from the map that owns the truth. It is a no-op
 // once the count is poisoned, which is load-bearing rather than defensive: a
-// receiver closing after the sender has closed syncs through here, and without
-// the guard it would write a zero over the poison and hand a closed bus back
-// to the fast path.
+// receiver closing after the sender has closed syncs through here, and a plain
+// store would put a zero over the poison and hand a closed bus back to the
+// fast path.
+//
+// The compare-and-swap is what makes that guard hold under concurrency. A
+// load-then-store leaves a window for a Poison to land between the two halves
+// and be overwritten, and that is the one error this type cannot tolerate: an
+// idle count on a closed bus makes every later send return nil instead of
+// ErrClosed, dropping values on a bus with no replay. The loop retries only
+// when the value moved under it, so the uncontended path — which is all a bus
+// holding its own lock ever takes — is one CAS.
 func (c *LiveCount) Sync(n int) {
-	if c.n.Load() == poisoned {
-		return
+	for {
+		cur := c.n.Load()
+		if cur == poisoned {
+			return
+		}
+		if c.forTestingBeforeStore != nil {
+			c.forTestingBeforeStore()
+		}
+		if c.n.CompareAndSwap(cur, int64(n)) {
+			return
+		}
 	}
-	c.n.Store(int64(n))
 }
 
 // Poison retires the fast path for the life of the bus, so every later send

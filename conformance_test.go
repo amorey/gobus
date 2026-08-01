@@ -27,26 +27,27 @@ import (
 // architecture is one bus type under test. newPair returns a live sender and
 // receiver on a fresh hub, already registered with each other.
 //
-// key is the key the suite must publish under for that receiver to see the
-// value. It exists because a bus may bind a receiver to a single key at
-// registration — watch does — and a suite that published elsewhere would make
-// the negative assertions pass vacuously against a bus that simply delivers
-// nothing. Every test body sends to a.key rather than a literal, so a new case
-// cannot drift out from under a single-key architecture.
+// key is the key the suite publishes under. It exists because a bus may bind a
+// receiver to a single key at registration — watch does — and a suite that
+// published elsewhere would make the negative assertions pass vacuously
+// against a bus that simply delivers nothing. Every test body sends to a.key
+// rather than a literal, and newPair is handed the same key, so neither side
+// can drift out from under a single-key architecture.
 type architecture struct {
 	name    string
 	key     int
-	newPair func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int])
+	newPair func(t *testing.T, key int) (gobus.Sender[int, int], gobus.Receiver[int, int])
 }
 
 var architectures = []architecture{
 	{
 		name: "conflate",
 		key:  1,
-		newPair: func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
+		newPair: func(t *testing.T, _ int) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
 			t.Helper()
 			// latest-wins, never annihilating: the simplest policy that keeps
-			// these tests about precedence rather than about coalescing.
+			// these tests about precedence rather than about coalescing. A
+			// conflate receiver takes every key, so it ignores the key.
 			h := conflate.New[int](func(_, next int) (int, bool) { return next, true })
 			t.Cleanup(h.Close)
 			return h.Sender(), h.Receiver()
@@ -55,17 +56,17 @@ var architectures = []architecture{
 	{
 		name: "watch",
 		key:  1,
-		newPair: func(t *testing.T) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
+		newPair: func(t *testing.T, key int) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
 			t.Helper()
 			// No Accept: latest-wins, the simplest policy, which keeps these
 			// tests about precedence. A watch receiver is bound to one key at
-			// registration, which is what architecture.key exists to state.
-			// Watch does not deliver its seed, so the receiver starts with
-			// nothing unread and the suite's first TryRecv sees ErrEmpty as it
-			// does for conflate.
+			// registration, which is why the key is threaded in rather than
+			// written twice. Watch does not deliver its seed, so the receiver
+			// starts with nothing unread and the suite's first TryRecv sees
+			// ErrEmpty as it does for conflate.
 			h := watch.New[int, int]()
 			t.Cleanup(h.Close)
-			return h.Sender(), h.Watch(1, 0)
+			return h.Sender(), h.Watch(key, 0)
 		},
 	},
 }
@@ -77,14 +78,14 @@ func TestSendContextPrecedenceConformance(t *testing.T) {
 	for _, a := range architectures {
 		t.Run(a.name, func(t *testing.T) {
 			t.Run("closed beats cancelled", func(t *testing.T) {
-				tx, _ := a.newPair(t)
+				tx, _ := a.newPair(t, a.key)
 				tx.Close()
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 				assert.ErrorIs(t, tx.SendContext(ctx, a.key, 10), gobus.ErrClosed)
 			})
 			t.Run("cancelled on a live sender", func(t *testing.T) {
-				tx, rx := a.newPair(t)
+				tx, rx := a.newPair(t, a.key)
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 				require.ErrorIs(t, tx.SendContext(ctx, a.key, 10), context.Canceled)
@@ -101,7 +102,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 	for _, a := range architectures {
 		t.Run(a.name, func(t *testing.T) {
 			t.Run("closed receiver beats cancelled", func(t *testing.T) {
-				_, rx := a.newPair(t)
+				_, rx := a.newPair(t, a.key)
 				rx.Close()
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
@@ -114,7 +115,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 				// closed with nothing buffered. A shutdown loop that cancels
 				// its own context still has to reach ErrClosed here rather
 				// than spin on ctx.Err().
-				tx, rx := a.newPair(t)
+				tx, rx := a.newPair(t, a.key)
 				tx.Close()
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
@@ -127,7 +128,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 				// implementation, and every other rank here would still pass
 				// if it did. Checked through the interface alone — a live
 				// handle is one that still delivers on a fresh context.
-				tx, rx := a.newPair(t)
+				tx, rx := a.newPair(t, a.key)
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
 				_, err := rx.RecvContext(ctx)
@@ -145,7 +146,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 			t.Run("cancelled beats a ready value", func(t *testing.T) {
 				// The rank that keeps cancellation observable under load, and
 				// the no-discard rule that bounds its cost.
-				tx, rx := a.newPair(t)
+				tx, rx := a.newPair(t, a.key)
 				require.NoError(t, tx.Send(a.key, 10))
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()
@@ -171,7 +172,7 @@ func TestRecvContextPrecedenceConformance(t *testing.T) {
 func TestSenderCloseDrainsBeforeClosedConformance(t *testing.T) {
 	for _, a := range architectures {
 		t.Run(a.name, func(t *testing.T) {
-			tx, rx := a.newPair(t)
+			tx, rx := a.newPair(t, a.key)
 			require.NoError(t, tx.Send(a.key, 42))
 			tx.Close()
 

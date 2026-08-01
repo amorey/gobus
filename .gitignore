@@ -28,3 +28,6 @@ go.work.sum
 # VS Code
 .vscode/
 *.code-workspace
+
+# Claude Code machine-local settings
+.claude/settings.local.json
