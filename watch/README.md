@@ -213,8 +213,18 @@ What is watch-specific:
 | `Receiver.Close()` | The unwatch. This handle only: any unread value is discarded and the key is dropped from the hub once no other receiver watches it. |
 | `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Watch()` calls return pre-closed handles.           |
 
-All idempotent. Don't call `Hub.Close` or `Sender.Close` concurrently with an
-active `Send` from another goroutine.
+All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from
+another goroutine — it tears down the receivers that send is fanning out to.
+
+`Sender.Close` **is** safe to call concurrently with a `Send` or `SendContext`
+from another goroutine. The two serialize, so a racing send resolves to exactly
+one of two outcomes — it publishes and returns `nil`, or it returns `ErrClosed`
+and publishes nothing. There is no third outcome and no partial one. Which
+ordering wins is unspecified: a caller that needs a value visible before
+shutdown must order the two itself, and a caller shutting down that doesn't care
+whether the last value lands needs no fence on its write path. This holds
+because `watch`'s `Send` never parks; it is a promise about this package, not a
+module-wide rule.
 
 A receiver's slot holds one value, so `Sender.Close()` drains **at most one
 value per receiver**. `Hub.Watch` after a `Sender.Close` returns a *live*

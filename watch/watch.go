@@ -207,6 +207,13 @@ func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
 // value after Close returns: if the feeder had already committed to a delivery
 // the close makes both arms of its select ready, and Go picks between ready
 // arms at random. The channel closes immediately after. See [Receiver.Chan].
+//
+// Unlike [Sender.Close], this one keeps the close-versus-send discipline: do
+// not call it concurrently with an active Send from another goroutine. It
+// tears down the receivers a send fans out to, so a racing send can deliver a
+// value into a receiver that is being closed — the value is not lost racily so
+// much as delivered to a handle that will never be read again, which is a
+// harder thing for a caller to reason about than the sender-close case.
 func (h *Hub[K, V]) Close() {
 	s := h.s
 	s.mu.Lock()
@@ -312,7 +319,20 @@ func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 // caught up sees ErrClosed at once. Further sends return ErrClosed.
 // Idempotent.
 //
-// Do not call it concurrently with an active Send from another goroutine.
+// Safe to call concurrently with a [Sender.Send] or [Sender.SendContext] from
+// another goroutine. The two serialize on the one state every send path reads
+// without the bus lock — the poisoned live count — so a racing send resolves to
+// exactly one of the two orderings: it publishes and returns nil, or it returns
+// ErrClosed and publishes nothing. There is no third outcome and no partial
+// one. *Which* ordering wins is unspecified, so a caller that needs a send to
+// be visible before shutdown must order the two itself; a caller shutting down
+// and not caring whether the last value lands need not fence anything.
+//
+// This is a promise about watch specifically, and it holds because Send never
+// parks: the whole of Close runs under s.mu, and the only step of a send that
+// runs outside it is the atomic load Close poisons. Do not read it as a
+// module-wide rule — [Hub.Close] keeps the close-versus-send discipline stated
+// in its own doc, since it tears down receivers a send is fanning out to.
 func (tx *Sender[K, V]) Close() {
 	s := tx.s
 	s.mu.Lock()
