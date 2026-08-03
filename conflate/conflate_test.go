@@ -1074,6 +1074,92 @@ func TestTryRecvAllEmptiesEveryStructure(t *testing.T) {
 	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 222}, {Key: 1, Value: 111}}, evs)
 }
 
+// TestTryRecvAllPrecedenceMatchesTryRecv pins that a cut is not a raw-state
+// read: a closed handle reports ErrClosed even with a full queue, which is what
+// keeps TryRecvAll from becoming a back door around the close precedence.
+func TestTryRecvAllPrecedenceMatchesTryRecv(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+
+			evs, err := rx.TryRecvAll()
+			assert.ErrorIs(t, err, gobus.ErrClosed, "a hard close outranks the queued values")
+			assert.Empty(t, evs, "an error result carries no values")
+		})
+	}
+}
+
+// TestTryRecvAllOnHardCloseAbandonsTheBacklog is the corollary a cursor-tracking
+// consumer has to respect: ErrClosed does not mean the backlog was empty.
+// Hub.Close and Receiver.Close abandon what is queued, so a consumer that reads
+// ErrClosed as "nothing pending" and commits the high end of its last batch
+// silently skips these writes. Only Sender.Close drains first.
+func TestTryRecvAllOnHardCloseAbandonsTheBacklog(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			require.NoError(t, h.Sender().Send(2, 22))
+			tt.close(h, rx)
+
+			_, err := rx.TryRecvAll()
+			require.ErrorIs(t, err, gobus.ErrClosed)
+			assert.Equal(t, 2, rx.lenForTest(),
+				"ErrClosed here coexists with a queued backlog, so it cannot be read as 'backlog empty'")
+		})
+	}
+}
+
+// TestTryRecvAllDrainsThenReportsClosed pins the no-partial-results rule across
+// the soft close: the whole queue comes back with a nil error, and only the
+// *next* call is terminal. There is never "some values and ErrClosed".
+func TestTryRecvAllDrainsThenReportsClosed(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	tx.Close()
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err, "Sender.Close is the soft path: the queue drains first")
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 1, Value: 11}, {Key: 2, Value: 22}}, evs)
+
+	// Drained and closed is terminal however it is observed, so the verdict
+	// carries the same deregistration TryRecv's and Peek's do.
+	assert.Equal(t, 1, h.forTestingReceiverCount())
+	evs, err = rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Empty(t, evs)
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "the terminal TryRecvAll skipped deregistration")
+}
+
+func TestTryRecvAllOnClosedReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	rx.Close()
+
+	_, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+func TestTryRecvAllCloseRaceBeforeLock(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 11))
+	// Close wins the race between the lock-free done pre-check and taking mu;
+	// the under-lock re-check must still return ErrClosed, not the queue.
+	rx.forTestingBeforeTryRecvAllLock = func() { rx.Close() }
+
+	evs, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Empty(t, evs)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

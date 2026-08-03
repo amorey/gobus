@@ -184,13 +184,15 @@ type Receiver[K comparable, V any] struct {
 	chOnce sync.Once
 	ch     chan gobus.Event[K, V]
 
-	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock and
-	// forTestingBeforePeekLock, if non-nil, run after the lock-free closed
-	// check and before taking s.mu, so tests can exercise the
-	// close-wins-the-race re-check under the lock. nil in production.
-	forTestingBeforeRecvLock    func()
-	forTestingBeforeTryRecvLock func()
-	forTestingBeforePeekLock    func()
+	// forTestingBeforeRecvLock, forTestingBeforeTryRecvLock,
+	// forTestingBeforeTryRecvAllLock and forTestingBeforePeekLock, if non-nil,
+	// run after the lock-free closed check and before taking s.mu, so tests can
+	// exercise the close-wins-the-race re-check under the lock. Every receive
+	// path with a lock-free closed pre-check has one. nil in production.
+	forTestingBeforeRecvLock       func()
+	forTestingBeforeTryRecvLock    func()
+	forTestingBeforeTryRecvAllLock func()
+	forTestingBeforePeekLock       func()
 
 	// forTestingFeederBeforeLock, forTestingFeederParked and
 	// forTestingFeederExit, if non-nil, are invoked by the Chan feeder:
@@ -571,8 +573,9 @@ func (rx *Receiver[K, V]) popAllLocked() []gobus.Event[K, V] {
 // drainedLocked reports the terminal condition shared by every receive path:
 // the sender is closed and this receiver's queue is empty, so nothing can ever
 // arrive again. It is the single definition of "this stream is over" —
-// recvLoop, TryRecv, Peek and feed each have their own body by design, but
-// must not each carry their own idea of when to stop. Caller holds s.mu.
+// recvLoop, TryRecv, TryRecvAll, Peek and feed each have their own body by
+// design, but must not each carry their own idea of when to stop. Caller holds
+// s.mu.
 //
 // order.Len() == 0 is exactly when popLocked fails, so testing it before the
 // pop is equivalent to the post-pop form and lets the check be ordered above
@@ -753,7 +756,17 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 
 // TryRecvAll pops every pending event without blocking and returns them in
 // queue order, leaving the receiver empty. It returns [gobus.ErrEmpty] if
-// nothing is pending.
+// nothing is pending, or [gobus.ErrClosed] if the receiver or hub is closed (or
+// the sender is closed and the pending values have drained) — the same
+// precedence [Receiver.TryRecv] applies, closed beating empty beating value.
+//
+// Partial results are not a case: either it returns every pending event with a
+// nil error, or no events and an error. There is never "some values and
+// ErrClosed", so a caller may test the error and ignore the slice. Against
+// [Sender.Close], the soft path, the whole queue comes back with a nil error
+// and only the next call is terminal. Note the corollary that ErrClosed is
+// therefore not a statement that the backlog was empty: [Hub.Close] and
+// [Receiver.Close] abandon whatever is still queued.
 //
 // The whole queue is taken under one acquisition of the hub lock, and that
 // atomicity is the contract rather than an optimization: the result is
@@ -784,8 +797,26 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 // goroutine. An event already handed to the [Receiver.Chan] feeder has left
 // the queue, so a cut does not include it.
 func (rx *Receiver[K, V]) TryRecvAll() ([]gobus.Event[K, V], error) {
+	if rx.done.IsClosed() {
+		return nil, gobus.ErrClosed
+	}
+	if rx.forTestingBeforeTryRecvAllLock != nil {
+		rx.forTestingBeforeTryRecvAllLock()
+	}
 	rx.s.mu.Lock()
 	defer rx.s.mu.Unlock()
+	// rx.done can flip between the lock-free check above and acquiring mu;
+	// Close holds mu before closing done, so a re-check here is race-free.
+	if rx.done.IsClosed() {
+		return nil, gobus.ErrClosed
+	}
+	// Drained-and-closed is terminal however it is observed, so this verdict
+	// carries the same tear-down the other popping paths' does, under the lock
+	// that decided it.
+	if rx.drainedLocked() {
+		rx.deregisterLocked()
+		return nil, gobus.ErrClosed
+	}
 	if evs := rx.popAllLocked(); len(evs) > 0 {
 		return evs, nil
 	}
