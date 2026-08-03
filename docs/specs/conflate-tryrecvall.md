@@ -1,6 +1,6 @@
 # Spec: `conflate.Receiver.TryRecvAll`
 
-- **Status:** proposed, not implemented
+- **Status:** accepted, implemented
 - **Date:** 2026-08-03
 - **Scope:** `github.com/amorey/gobus`, package `conflate`
 - **Supersedes:** the `Receiver.Drain` feature request in

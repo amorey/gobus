@@ -65,6 +65,12 @@
 // returns the oldest pending event and leaves it in place, under the same
 // closed > value precedence the popping paths use.
 //
+// The whole backlog is takeable as one cut. [Receiver.TryRecvAll] pops
+// everything pending under a single acquisition of the bus lock, so a consumer
+// that reads a burst as one unit gets a batch with defined membership —
+// everything pending as of one instant — rather than whatever a loop of
+// [Receiver.TryRecv] happened to observe across several.
+//
 // Sender close drains. [Sender.Close] lets each receiver drain its pending
 // values once before subsequent reads report [gobus.ErrClosed]. [Hub.Close]
 // is hard tear-down with no drain.
@@ -621,11 +627,13 @@ func (rx *Receiver[K, V]) Recv() (gobus.Event[K, V], error) {
 // hub's lifetime. `defer rx.Close()` covers it, as it does for any abandoned
 // receiver.
 //
-// To consume what is left before closing, loop on [Receiver.TryRecv] until it
-// reports any error, then Close. The flush alone is not a substitute for the
-// Close: against a still-open sender it ends on ErrEmpty, which is not
-// terminal and does not deregister — only a drain that reaches ErrClosed does
-// that on its own.
+// To consume what is left before closing, call [Receiver.TryRecvAll] once —
+// it takes the whole remaining queue, and its error reports which state the
+// flush stopped in — or loop on [Receiver.TryRecv] until it reports any error.
+// Then Close. The flush alone is not a substitute for the Close: against a
+// still-open sender either form ends on ErrEmpty, which is not terminal and
+// does not deregister — only a drain that reaches ErrClosed does that on its
+// own.
 func (rx *Receiver[K, V]) RecvContext(ctx context.Context) (gobus.Event[K, V], error) {
 	return rx.recvLoop(ctx)
 }
@@ -841,7 +849,9 @@ func (rx *Receiver[K, V]) TryRecvAll() ([]gobus.Event[K, V], error) {
 //
 // Peek takes the hub lock, the same one that serializes the whole Send
 // fan-out, so polling it in a loop slows every publisher and every other
-// receiver on the hub. Call it once per unit of work, not as a spin.
+// receiver on the hub. Call it once per unit of work, not as a spin. When the
+// unit of work is a whole burst, [Receiver.TryRecvAll] is how to take it in one
+// call rather than a loop.
 //
 // Peek is safe to call from any goroutine, but like the rest of the receive
 // side it is only meaningful on the receiver's single consuming goroutine: a
