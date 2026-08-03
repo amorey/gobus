@@ -9,11 +9,12 @@
 
 ## Introduction
 
-This library is a collection of common event bus architectures for Go. It's designed as a sister library to [`gochan`](https://github.com/amorey/gochan) which is a collection of lower-level channel architectures. Unlike keyless channels, event buses pass messages between senders and receivers based on keys and the interesting design decisions are about what happens when several values for the same key are in flight at once. Currently these are the event bus archictures included in this library:
+This library is a collection of common event bus architectures for Go. It's designed as a sister library to [`gochan`](https://github.com/amorey/gochan) which is a collection of lower-level channel architectures. Unlike keyless channels, event buses pass messages between senders and receivers based on keys and the interesting design decisions are about what happens when several values for the same key are in flight at once. Currently these are the event bus architectures included in this library:
 
-| Package    | Senders | Receivers | Semantics                                                                   |
-| ---------- | ------- | --------- | --------------------------------------------------------------------------- |
-| `conflate` | 1       | many      | Keyed latest-value fan-out: per-key coalescing via a caller-supplied merge. |
+| Package                             | Senders | Receivers | Semantics                                                                        |
+| ----------------------------------- | ------- | --------- | -------------------------------------------------------------------------------- |
+| [`conflate`](./conflate/README.md)  | 1       | many      | Keyed latest-value fan-out: per-key coalescing via a caller-supplied merge.       |
+| [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key and holds its current value.        |
 
 ## Installation
 
@@ -33,7 +34,7 @@ Requires Go 1.21+.
 
 ### Conflate
 
-Conflate is a single-producer, multi-consumer keyed latest-value bus. Every value published through the singleton `Sender` is fanned out to *every* live `Receiver`, but each receiver holds **one slot per key** plus an insertion-ordered key queue. A `Send()` for a key that already has an undelivered value coalesces into that slot via a caller-supplied `Merge` function instead of appending, and the key keeps its original queue position. Because `conflate` keeps the latest value **per key**, a slow receiver catches up to the current state of *every* key in first-touch order and its memory stays bounded by the live key set rather than by write volume.
+Keyed latest-value **fan-out**. Every value reaches every receiver, but each receiver holds one slot per key: a `Send` for a key that is still undelivered coalesces into that slot via a caller-supplied `Merge` rather than queueing behind it. A slow receiver catches up to the current state of *every* key, in first-touch order, on memory bounded by the live key set instead of by write volume.
 
 ```go
 hub := conflate.New[string, Update](merge)
@@ -56,66 +57,15 @@ go func() {
 for _, u := range updates { tx.Send(u.Key, u) }
 ```
 
-Receivers take composable options, minted by the hub. `WithKeyFilter` filters at *enqueue*, so an unwanted key never occupies a slot — that's how a consumer watching one key of a high-cardinality producer stays bounded by that one key. `WithMerge` gives a single consumer its own coalescing policy, which matters when consumers of the same producer disagree about what may be dropped; one hub-wide `Merge` cannot express that.
+Highlights: per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to read the backlog head without consuming it; `TryRecvAll()` to take the whole backlog as one atomic cut; a lock-free `Send` fast path when nobody is subscribed.
 
-```go
-rx := hub.Receiver(hub.WithKeyFilter(func(k string) bool { return k == "db-0" }))
-rx := hub.Receiver(hub.WithMerge(stricter))
-rx := hub.Receiver(hub.WithKeyFilter(wanted), hub.WithMerge(stricter))  // compose
-```
-
-#### Inspecting the backlog head
-
-`Peek()` returns the oldest pending event without removing it — `TryRecv` minus the pop, sharing its precedence exactly: `ErrEmpty` when nothing is pending, `ErrClosed` when the receiver or hub is closed or the sender has closed and the queue has drained. It is not a raw read of the queue, so a closed handle reports `ErrClosed` even with a value at the head. The corollary matters if you track a cursor: `ErrClosed` is *not* a statement that the backlog was empty, because `Receiver.Close()` and `Hub.Close()` abandon whatever is still queued. Only `Sender.Close()` drains first.
-
-The value you get back is the current merged contents of the head key's slot, so it can change between two `Peek`s while the head *key* does not — coalescing leaves queue position alone. Annihilation is the exception: a `Merge` returning `keep == false` for the head key removes it, and the next `Peek` reports a different key.
-
-```go
-ev, err := rx.Peek()   // what would Recv hand me next, without taking it?
-```
-
-Two cautions. `Peek` takes the same hub lock that serializes the entire `Send` fan-out, so polling it in a loop degrades every publisher and every other receiver on the bus — call it once per unit of work. When that unit of work is a whole burst, `TryRecvAll()` below is how you say so in one call. And while it is safe to call from any goroutine, it is only *meaningful* on the receiver's single consuming goroutine: anything else consuming concurrently can take the event you just looked at. An event already handed to the `Chan` feeder has left the queue, so `Peek` reports `ErrEmpty` while that one event is in flight.
-
-The intended use is a consumer that needs to know how far its backlog reaches — a resumable cursor or watermark. Fold the ordering quantity into `V` and let the bus's own `Merge` carry it: stamp each value at publication, keep the *earliest* stamp when two values for a key coalesce, and read it off the head. The bus makes no ordering claim of its own here, so the premise that publication order matches that quantity's order is yours to hold; if it doesn't, the head key's stamp is not the lowest one pending.
-
-#### Taking the whole backlog at once
-
-`TryRecvAll()` pops everything pending, in queue order, and empties the queue — `TryRecv` applied to the whole queue instead of the head, under one acquisition of the hub lock. It shares that precedence too: `ErrEmpty` when nothing is pending, `ErrClosed` on the same terminal conditions.
-
-```go
-evs, err := rx.TryRecvAll()   // everything pending, as of one instant
-```
-
-The atomicity is the contract, not an optimization. A loop of `TryRecv` is a *sequence* of instants, so the batch it assembles has no defined membership — a `Send` landing between two iterations joins it, one landing just after the loop observes empty does not — and no caller can close that gap from outside the lock. This matters most for the cursor case above. Conflate delivers in first-touch order, which carries no relation to any ordering quantity inside `V`, so a consumer that sorts its batch by that quantity needs the batch to be a complete set: take a proper subset and the next batch interleaves with the one you already committed. `TryRecvAll` supplies the *set*; you still sort it.
-
-Two properties of the returned slice are worth building on. It is in queue order, which is first-touch order — sort if you need value order. And it holds one entry per key, since a receiver's queue holds each key once, so it folds into a map without deduping. That second one belongs to a *single* call: an event that has already left the receiver's slots cannot be coalesced into, so a batch you assemble from a `Recv` plus a `TryRecvAll` can contain the same key twice.
-
-Partial results are not a case — either every pending event with a nil error, or no events and an error — so you can test the error and ignore the slice. Against `Sender.Close()` the whole queue still comes back with a nil error and only the *next* call reports `ErrClosed`.
-
-There is no `max` parameter. A cap would hand back exactly the split the method exists to prevent, and it is unnecessary: a receiver's memory is already bounded by the live key set rather than by write volume, so "everything pending" is bounded by construction. Note the trade against a `TryRecv` loop, though: total lock acquisitions go down, but this one is held for the length of the queue, so worst-case *publisher* latency goes up. No caller code runs inside it — no `Merge`, no key filter — which is what keeps that hold bounded.
-
-#### Publishing with no receivers
-
-`Send` on a hub with no live receiver returns `nil` without taking the bus lock. That lock is hub-wide — every `Send` fan-out, every pop, `Recv`, `Peek`, `TryRecv`, `TryRecvAll` and `Close` serializes through it — so the cost of an unwatched hub otherwise lands on the *producer's* hot path, per publish, whether or not anything reads the result. This matters when values are published from inside a producer's own critical sections: without it, every write in a subsystem pays a mutex for a bus nobody is subscribed to.
-
-The result is unchanged, only the cost: a send with no receivers already fanned out to nobody. `TrySend` and `SendContext` take the same path, and a cancelled `ctx` is still reported rather than swallowed. A closed sender still returns `ErrClosed` on an empty receiver set.
-
-The corollary is an ordering requirement on **your** side, and it is the one thing to get right:
-
-```go
-rx := hub.Receiver()   // register FIRST
-state := snapshot()    // then read your snapshot
-```
-
-Take the snapshot before registering and any value published in the gap reaches no receiver — conflate has no replay, and the next `Send` for that key coalesces into a slot your consumer was never told had been skipped. This has always been conflate's delivery model; a publisher that skips the lock simply makes it unforgiving.
+**[Full documentation →](./conflate/README.md)**
 
 [Recv Example](./conflate/examples/recv/main.go) · [Chan Example](./conflate/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
 ### Watch
 
-Watch is a single-producer, multi-consumer keyed **state** bus. Where `conflate` streams events, `watch` distributes the *current value* of a key: each `Receiver` watches exactly one key and holds **one slot** for it, so a slow consumer skips to the current value rather than replaying what it missed.
-
-A receiver is created by `Hub.Watch`, which is also where its baseline comes from — the caller passes the value it has just read, and `Receiver.Close()` is the matching unwatch.
+Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver watches exactly one key and holds one slot for it, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch.
 
 ```go
 hub := watch.New[ObjectID](watch.WithAccept(func(prev, next Stamped) bool {
@@ -136,31 +86,9 @@ for ev := range rx.Chan() {
 }
 ```
 
-Three things distinguish it from `conflate`:
+Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — which is why wide subscriptions want `conflate` instead.
 
-**Registration is the snapshot.** `Watch` takes the value you have just read and never hands it back — it is the baseline, not a delivery. Because `Watch` calls no caller code, you can read your state and register in one critical section, which removes the register-before-read ordering rule `conflate` imposes. This is the **opposite** of `gochan/watch`, whose registration deliberately does not snapshot; don't carry that rule across.
-
-**`Accept` decides which value wins.** Instead of a `Merge`, `watch` takes an optional `Accept func(prev, next V) bool`. It runs under the bus lock once for each receiver watching the key, against *that receiver's own current value* — so one value can be new for a receiver that subscribed early and stale for one that subscribed late. This is what makes the settled value independent of which of two concurrent `Send` calls takes the lock first, provided your rule is a strict order over `V`. Without the option every value is accepted, which is last-writer-wins.
-
-`Accept` is caller code running under the bus lock. It must not call back into the hub, and it must not take any lock a caller may hold while calling `Watch`, `Send` or `Close` — `Watch` is expressly safe under a producer's lock, so an `Accept` that takes that same lock inverts the two orders and deadlocks. Reading its two arguments and nothing else is always safe.
-
-**One key per receiver.** There is no `Unwatch` and no key set: the constraint is structural, which is what removes the questions a mutable key set raises. A consumer watching N keys therefore holds N receivers and, if it uses `Chan()`, N goroutines — so `watch` is deliberately unsuited to wide subscriptions. A wide change-stream consumer wants `conflate`, which has the annihilation that a create-then-delete pair needs.
-
-`Send` for a key nobody watches is dropped, and nothing is retained: there is no receiver and therefore no buffer. `Send` on a hub with no receiver at all returns `nil` without taking the bus lock, exactly as `conflate` does.
-
-#### Inspecting what is unread
-
-`Peek()` returns the value a receive would hand back and leaves it unread — `TryRecv` minus the take, sharing its precedence exactly: `ErrEmpty` when nothing has superseded what this receiver has already seen, `ErrClosed` when the receiver or hub is closed or the sender has closed and the final value has been taken.
-
-```go
-ev, err := rx.Peek()   // what would Recv hand me next, without taking it?
-```
-
-It reports what is **unread**, not the key's current state. A caught-up receiver gets `ErrEmpty` even though its slot holds a perfectly good value, and a closed handle gets `ErrClosed` even with a value waiting. If you want the current state on demand, keep your own copy of the last value read — the reading goroutine already has it, and it costs no lock.
-
-Between two `Peek`s the key is fixed, since a receiver watches one key for life, but the value is not: a `Send` your `Accept` takes replaces the slot, so the second `Peek` reports the newer value and the older one is never handed back by either path. That is the same skip-ahead every read on this bus is subject to, only visible without consuming.
-
-Two cautions, as on `conflate`. `Peek` takes the same hub lock that serializes the entire `Send` fan-out, so polling it in a loop degrades every publisher and every other receiver on the bus — call it once per unit of work. And while it is safe to call from any goroutine, it is only *meaningful* on the receiver's single consuming goroutine. Unlike `conflate`'s `Peek`, a value already handed to the `Chan` feeder is still visible: the feeder marks it read only once the consumer has taken it.
+**[Full documentation →](./watch/README.md)**
 
 [Recv Example](./watch/examples/recv/main.go) · [Chan Example](./watch/examples/chan/main.go) · [Docs](https://pkg.go.dev/github.com/amorey/gobus/watch)
 

@@ -15,9 +15,14 @@ flight at once. Requires Go 1.21+.
 Currently two bus types: `conflate` (keyed event bus) and `watch` (keyed
 state bus).
 
-See `README.md` for the full public API reference (constructors, methods,
-semantics tables, error meanings). When changing public behavior, update
-`README.md` in the same change.
+Documentation is two-tier. The root `README.md` carries the module-wide
+material — the bus-type index, the common interfaces, the shared errors and the
+close/cancel precedence — plus a deliberately terse overview of each bus type.
+Each bus package then has its own `README.md` (`conflate/README.md`,
+`watch/README.md`) holding that type's full public API reference: constructors,
+methods, semantics, options, close table, error meanings. When changing public
+behavior, update the package's README in the same change, and the root one too
+if the change touches anything cross-architecture.
 
 ## Commands
 
@@ -62,8 +67,8 @@ environment issue, not a code issue, and does not affect CI (Linux).
 - `gobus.go` — common `Sender[K, V]` and `Receiver[K, V]` interfaces every
   package's handles implement, plus `Event[K, V]`. These doc comments are the
   module-wide contract, not a summary of `conflate`: a change to public
-  close/cancel behavior updates `gobus.go`, `README.md` and the conformance
-  suite, not just the package. There is intentionally no
+  close/cancel behavior updates `gobus.go`, the root `README.md` and the
+  conformance suite, not just the package and its own README. There is intentionally no
   shared `Hub` interface — each bus package exposes its own concrete
   `*Hub[K, V]` so callers can't accidentally substitute one architecture for
   another.
@@ -143,7 +148,7 @@ a change to one usually needs the mirror change in the other.
 the whole queue via `popAllLocked` under a single acquisition, which is its
 contract rather than an optimization — a `TryRecv` loop is a sequence of
 instants and so yields a batch with no defined membership. See
-`docs/specs/conflate-tryrecvall.md`. Two invariants hold it up. Its locked
+`docs/adr/2026-08-03-conflate-tryrecvall.md`. Two invariants hold it up. Its locked
 region must keep running **no caller code** — no `Merge`, no key filter — since
 it is O(live keys) and every publisher waits behind it. And it must clear
 `elems` and `pending` as well as `order`: a stale `elems` entry sends the next
