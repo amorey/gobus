@@ -1020,6 +1020,227 @@ func TestPeekAllocatesNothing(t *testing.T) {
 	assert.Equal(t, gobus.Event[int, int]{Key: 0, Value: 0}, peekSink)
 }
 
+// TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder pins the shape of a cut.
+// The slice is asserted whole rather than by membership: order is part of the
+// contract, and a duplicated key — the thing one entry per key rules out —
+// would pass any membership check.
+func TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, 99)) // coalesces in place; key 1 keeps its position
+	require.NoError(t, tx.Send(3, 33))
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{
+		{Key: 1, Value: 99}, {Key: 2, Value: 22}, {Key: 3, Value: 33},
+	}, evs, "first-touch order, with the coalesced key merged at its original position")
+}
+
+func TestTryRecvAllOnEmptyReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+
+	evs, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+	assert.Empty(t, evs, "an error result carries no values")
+}
+
+// TestTryRecvAllEmptiesEveryStructure proves the cut cleared elems and pending,
+// not just order. A stale elems entry would send the next Send for that key
+// down the coalesce branch, which writes a slot without pushing the key back
+// onto the queue — so the key would vanish rather than reappear at the tail.
+func TestTryRecvAllEmptiesEveryStructure(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+
+	_, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Zero(t, rx.lenForTest())
+	assertEmpty(t, rx)
+
+	// Re-send both drained keys in the opposite order: each is a first touch
+	// again, so the new cut is ordered by the new touches, not the old ones.
+	require.NoError(t, tx.Send(2, 222))
+	require.NoError(t, tx.Send(1, 111))
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 222}, {Key: 1, Value: 111}}, evs)
+}
+
+// TestTryRecvAllPrecedenceMatchesTryRecv pins that a cut is not a raw-state
+// read: a closed handle reports ErrClosed even with a full queue, which is what
+// keeps TryRecvAll from becoming a back door around the close precedence.
+func TestTryRecvAllPrecedenceMatchesTryRecv(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			tt.close(h, rx)
+
+			evs, err := rx.TryRecvAll()
+			assert.ErrorIs(t, err, gobus.ErrClosed, "a hard close outranks the queued values")
+			assert.Empty(t, evs, "an error result carries no values")
+		})
+	}
+}
+
+// TestTryRecvAllOnHardCloseAbandonsTheBacklog is the corollary a cursor-tracking
+// consumer has to respect: ErrClosed does not mean the backlog was empty.
+// Hub.Close and Receiver.Close abandon what is queued, so a consumer that reads
+// ErrClosed as "nothing pending" and commits the high end of its last batch
+// silently skips these writes. Only Sender.Close drains first.
+func TestTryRecvAllOnHardCloseAbandonsTheBacklog(t *testing.T) {
+	for _, tt := range hardCloses {
+		t.Run(tt.name, func(t *testing.T) {
+			h := New[int](latestWins)
+			rx := h.Receiver()
+			require.NoError(t, h.Sender().Send(1, 11))
+			require.NoError(t, h.Sender().Send(2, 22))
+			tt.close(h, rx)
+
+			_, err := rx.TryRecvAll()
+			require.ErrorIs(t, err, gobus.ErrClosed)
+			assert.Equal(t, 2, rx.lenForTest(),
+				"ErrClosed here coexists with a queued backlog, so it cannot be read as 'backlog empty'")
+		})
+	}
+}
+
+// TestTryRecvAllDrainsThenReportsClosed pins the no-partial-results rule across
+// the soft close: the whole queue comes back with a nil error, and only the
+// *next* call is terminal. There is never "some values and ErrClosed".
+func TestTryRecvAllDrainsThenReportsClosed(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	tx.Close()
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err, "Sender.Close is the soft path: the queue drains first")
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 1, Value: 11}, {Key: 2, Value: 22}}, evs)
+
+	// Drained and closed is terminal however it is observed, so the verdict
+	// carries the same deregistration TryRecv's and Peek's do.
+	assert.Equal(t, 1, h.forTestingReceiverCount())
+	evs, err = rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Empty(t, evs)
+	assert.Equal(t, 0, h.forTestingReceiverCount(), "the terminal TryRecvAll skipped deregistration")
+}
+
+func TestTryRecvAllOnClosedReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	rx.Close()
+
+	_, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+func TestTryRecvAllCloseRaceBeforeLock(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	require.NoError(t, h.Sender().Send(1, 11))
+	// Close wins the race between the lock-free done pre-check and taking mu;
+	// the under-lock re-check must still return ErrClosed, not the queue.
+	rx.forTestingBeforeTryRecvAllLock = func() { rx.Close() }
+
+	evs, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.Empty(t, evs)
+}
+
+// TestTryRecvAllSeesAnnihilation pins that a cut reflects the Merge policy
+// rather than a raw history: an annihilated key is absent entirely, not present
+// carrying a tombstone value.
+func TestTryRecvAllSeesAnnihilation(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, -1)) // negative annihilates key 1
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 22}}, evs)
+}
+
+func TestTryRecvAllRespectsKeyFilter(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never in a cut
+	require.NoError(t, tx.Send(7, 77))
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 7, Value: 77}}, evs)
+}
+
+// TestTryRecvAllExcludesTheEventInFlightToTheFeeder pins the Chan interaction
+// the doc comment claims, and it is the one place a cut is not "everything the
+// receiver holds": the feeder pops under s.mu and parks on delivery outside it,
+// so one event can be in flight and invisible to the cut. Sequenced through the
+// feeder's parked hook — it has popped and not yet delivered when it runs —
+// rather than through the channel, which would race the delivery.
+func TestTryRecvAllExcludesTheEventInFlightToTheFeeder(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	defer rx.Close()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+
+	popped := make(chan struct{})
+	release := make(chan struct{})
+	rx.forTestingFeederParked = func() {
+		close(popped)
+		<-release
+	}
+	ch := rx.Chan()
+
+	<-popped
+	require.NoError(t, tx.Send(2, 22)) // arrives after the feeder took key 1
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 22}}, evs,
+		"the in-flight event has left the queue, so a cut cannot see it")
+
+	close(release)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, <-ch, "the event is delivered, not lost")
+}
+
+// tryRecvAllSink is a package-level sink for the allocation test, for the same
+// escape-analysis reason peekSink is.
+var tryRecvAllSink []gobus.Event[int, int]
+
+// TestTryRecvAllOnEmptyAllocatesNothing pins the empty cut specifically. A
+// non-empty one necessarily allocates its result slice — that is the method's
+// whole job, and it is why the size of the critical section is documented — but
+// a caller polling an idle receiver should pay nothing.
+//
+// It pins the outcome, not the code shape: a zero-capacity make is itself free,
+// so hoisting the allocation above the empty check survives this test. What it
+// does catch is an allocation whose size does not follow the pending count.
+func TestTryRecvAllOnEmptyAllocatesNothing(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+
+	avg := testing.AllocsPerRun(100, func() { tryRecvAllSink, _ = rx.TryRecvAll() })
+	assert.Zero(t, avg, "an empty cut should allocate nothing")
+	assert.Empty(t, tryRecvAllSink)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

@@ -139,6 +139,18 @@ parks on a per-receiver `notify` channel that `signalLocked` closes-and-replaces
 `feed` is a per-receiver goroutine backing `Chan`. Both must stay consistent —
 a change to one usually needs the mirror change in the other.
 
+`TryRecvAll` is the one reader that does not go through `popLocked`: it takes
+the whole queue via `popAllLocked` under a single acquisition, which is its
+contract rather than an optimization — a `TryRecv` loop is a sequence of
+instants and so yields a batch with no defined membership. See
+`docs/specs/conflate-tryrecvall.md`. Two invariants hold it up. Its locked
+region must keep running **no caller code** — no `Merge`, no key filter — since
+it is O(live keys) and every publisher waits behind it. And it must clear
+`elems` and `pending` as well as `order`: a stale `elems` entry sends the next
+`Send` for that key down the coalesce branch, which writes a slot without
+re-queuing the key, so the key silently vanishes instead of reappearing at the
+tail.
+
 **Close/cancel precedence is one ordered run under `s.mu`.** `recvLoop`
 resolves **closed > cancelled > value**: receiver/hub closed, then
 sender-closed-and-drained (`txClosed && order.Len() == 0`, which is exactly
