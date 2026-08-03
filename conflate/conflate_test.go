@@ -1160,6 +1160,87 @@ func TestTryRecvAllCloseRaceBeforeLock(t *testing.T) {
 	assert.Empty(t, evs)
 }
 
+// TestTryRecvAllSeesAnnihilation pins that a cut reflects the Merge policy
+// rather than a raw history: an annihilated key is absent entirely, not present
+// carrying a tombstone value.
+func TestTryRecvAllSeesAnnihilation(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, -1)) // negative annihilates key 1
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 22}}, evs)
+}
+
+func TestTryRecvAllRespectsKeyFilter(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never in a cut
+	require.NoError(t, tx.Send(7, 77))
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 7, Value: 77}}, evs)
+}
+
+// TestTryRecvAllExcludesTheEventInFlightToTheFeeder pins the Chan interaction
+// the doc comment claims, and it is the one place a cut is not "everything the
+// receiver holds": the feeder pops under s.mu and parks on delivery outside it,
+// so one event can be in flight and invisible to the cut. Sequenced through the
+// feeder's parked hook — it has popped and not yet delivered when it runs —
+// rather than through the channel, which would race the delivery.
+func TestTryRecvAllExcludesTheEventInFlightToTheFeeder(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	defer rx.Close()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+
+	popped := make(chan struct{})
+	release := make(chan struct{})
+	rx.forTestingFeederParked = func() {
+		close(popped)
+		<-release
+	}
+	ch := rx.Chan()
+
+	<-popped
+	require.NoError(t, tx.Send(2, 22)) // arrives after the feeder took key 1
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 22}}, evs,
+		"the in-flight event has left the queue, so a cut cannot see it")
+
+	close(release)
+	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 11}, <-ch, "the event is delivered, not lost")
+}
+
+// tryRecvAllSink is a package-level sink for the allocation test, for the same
+// escape-analysis reason peekSink is.
+var tryRecvAllSink []gobus.Event[int, int]
+
+// TestTryRecvAllOnEmptyAllocatesNothing pins the empty cut specifically. A
+// non-empty one necessarily allocates its result slice — that is the method's
+// whole job, and it is why the size of the critical section is documented — but
+// a caller polling an idle receiver should pay nothing.
+//
+// It pins the outcome, not the code shape: a zero-capacity make is itself free,
+// so hoisting the allocation above the empty check survives this test. What it
+// does catch is an allocation whose size does not follow the pending count.
+func TestTryRecvAllOnEmptyAllocatesNothing(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+
+	avg := testing.AllocsPerRun(100, func() { tryRecvAllSink, _ = rx.TryRecvAll() })
+	assert.Zero(t, avg, "an empty cut should allocate nothing")
+	assert.Empty(t, tryRecvAllSink)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()
