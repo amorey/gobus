@@ -257,7 +257,22 @@ Mirror `gochan`'s conventions unless there's a reason not to.
   `s.mu` and on neither fast path, which is how a test proves the lock was
   skipped without timing.
 - Don't call `Hub.Close` concurrently with an active `Send` from another
-  goroutine — it inherits the sender's close discipline.
+  goroutine — it tears down the receivers that send is fanning out to, so a
+  racing send can deliver into a handle that will never be read again.
+  `watch.Sender.Close` is the one documented exception, and only in `watch`:
+  it *promises* concurrent-`Send` safety, because `Send` never parks there, the
+  whole close body runs under `s.mu`, and the only step of a send outside that
+  lock is the atomic load the close poisons. The promise is deliberately narrow
+  — "exactly one of published-and-`nil` or `ErrClosed`-and-nothing-published,
+  which one unspecified" — so it constrains only what the structure already
+  guarantees. What it does cost is the freedom to put a lock-free fast path in
+  `watch.Sender.Close`; that was judged worth nothing there, and the judgement
+  is what to revisit, not the promise. It is pinned by
+  `TestSenderCloseIsSafeConcurrentWithSend` and its `SendContext` twin, both
+  driven through `forTestingBeforeSendLock` rather than by a `-race` harness:
+  the seam lands the close in the one window a send is committed to publishing
+  but has not yet reached the lock, which a timing loop would only sample by
+  luck. Don't extend the promise to `conflate` without redoing that reasoning.
 
 ## Testing
 

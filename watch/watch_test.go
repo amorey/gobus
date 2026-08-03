@@ -384,6 +384,79 @@ func TestSenderCloseRejectsFurtherSends(t *testing.T) {
 	assert.NotPanics(t, tx.Close)
 }
 
+// TestSenderCloseIsSafeConcurrentWithSend pins the guarantee Sender.Close's
+// doc makes: a send racing the close resolves to one of exactly two outcomes,
+// published-and-nil or ErrClosed-and-nothing-published, with no third state.
+//
+// The seam is what makes that deterministic rather than a timing harness. It
+// runs after the send has declined the fast path and before it takes s.mu, so
+// a Close fired from there lands exactly in the window a concurrent
+// Sender.Close would occupy — the one moment a send is committed to
+// publishing but has not yet reached the lock that decides whether it may. A
+// -race loop would only sample that window by luck, and would pass vacuously
+// if it never hit it.
+//
+// Both directions are asserted, because the guarantee is two-sided: the losing
+// send publishes nothing (the receiver's slot still holds its baseline), and a
+// send that wins the ordering is still drained by the soft close.
+func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
+	t.Run("close lands first", func(t *testing.T) {
+		h := New[string, val]()
+		tx := h.Sender()
+		rx := h.Watch("a", val{N: 1})
+
+		h.s.forTestingBeforeSendLock = func() { tx.Close() }
+		assert.ErrorIs(t, tx.Send("a", val{N: 2}), gobus.ErrClosed)
+		h.s.forTestingBeforeSendLock = nil
+
+		// Terminal at once, which is only true if nothing was published: a
+		// slot holding N:2 would drain it before reporting ErrClosed.
+		_, err := rx.TryRecv()
+		assert.ErrorIs(t, err, gobus.ErrClosed)
+	})
+
+	t.Run("send lands first", func(t *testing.T) {
+		h := New[string, val]()
+		tx := h.Sender()
+		rx := h.Watch("a", val{N: 1})
+
+		require.NoError(t, tx.Send("a", val{N: 2}))
+		tx.Close()
+
+		assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
+	})
+}
+
+// TestSenderCloseIsSafeConcurrentWithSendContext is the SendContext twin. The
+// promise covers both send paths, and SendContext reaches the lock by its own
+// route — the fast path it declines is the one that also consults ctx.
+func TestSenderCloseIsSafeConcurrentWithSendContext(t *testing.T) {
+	h := New[string, val]()
+	tx := h.Sender()
+	rx := h.Watch("a", val{N: 1})
+
+	h.s.forTestingBeforeSendLock = func() { tx.Close() }
+	assert.ErrorIs(t, tx.SendContext(context.Background(), "a", val{N: 2}), gobus.ErrClosed)
+	h.s.forTestingBeforeSendLock = nil
+
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// TestSenderCloseOnIdleHubRacesToNilOrClosed pins the other half of "no third
+// outcome": with no receiver a send answers from the lock-free load, so the
+// close it races is either already poisoned or not yet. Both answers are the
+// contract; neither publishes anything, since there is nobody watching.
+func TestSenderCloseOnIdleHubRacesToNilOrClosed(t *testing.T) {
+	h := New[string, val]()
+	tx := h.Sender()
+	require.Zero(t, h.forTestingReceiverCount(), "the fast path is what is under test")
+
+	assert.NoError(t, tx.Send("a", val{N: 1}), "load precedes the poison")
+	tx.Close()
+	assert.ErrorIs(t, tx.Send("a", val{N: 2}), gobus.ErrClosed, "load follows the poison")
+}
+
 func TestTerminalErrClosedDropsTheKey(t *testing.T) {
 	// R41 and R43: a receiver leaves the hub by draining, not only by Close,
 	// and both reading paths owe the same tear-down.
