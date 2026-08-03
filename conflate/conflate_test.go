@@ -1020,6 +1020,60 @@ func TestPeekAllocatesNothing(t *testing.T) {
 	assert.Equal(t, gobus.Event[int, int]{Key: 0, Value: 0}, peekSink)
 }
 
+// TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder pins the shape of a cut.
+// The slice is asserted whole rather than by membership: order is part of the
+// contract, and a duplicated key — the thing one entry per key rules out —
+// would pass any membership check.
+func TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+	require.NoError(t, tx.Send(1, 99)) // coalesces in place; key 1 keeps its position
+	require.NoError(t, tx.Send(3, 33))
+
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{
+		{Key: 1, Value: 99}, {Key: 2, Value: 22}, {Key: 3, Value: 33},
+	}, evs, "first-touch order, with the coalesced key merged at its original position")
+}
+
+func TestTryRecvAllOnEmptyReceiver(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+
+	evs, err := rx.TryRecvAll()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+	assert.Empty(t, evs, "an error result carries no values")
+}
+
+// TestTryRecvAllEmptiesEveryStructure proves the cut cleared elems and pending,
+// not just order. A stale elems entry would send the next Send for that key
+// down the coalesce branch, which writes a slot without pushing the key back
+// onto the queue — so the key would vanish rather than reappear at the tail.
+func TestTryRecvAllEmptiesEveryStructure(t *testing.T) {
+	h := New[int](latestWins)
+	rx := h.Receiver()
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 11))
+	require.NoError(t, tx.Send(2, 22))
+
+	_, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Zero(t, rx.lenForTest())
+	assertEmpty(t, rx)
+
+	// Re-send both drained keys in the opposite order: each is a first touch
+	// again, so the new cut is ordered by the new touches, not the old ones.
+	require.NoError(t, tx.Send(2, 222))
+	require.NoError(t, tx.Send(1, 111))
+	evs, err := rx.TryRecvAll()
+	require.NoError(t, err)
+	assert.Equal(t, []gobus.Event[int, int]{{Key: 2, Value: 222}, {Key: 1, Value: 111}}, evs)
+}
+
 func TestReceiverClose(t *testing.T) {
 	h := New[int](latestWins)
 	rx := h.Receiver()

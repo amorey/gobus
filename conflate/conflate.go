@@ -542,6 +542,32 @@ func (rx *Receiver[K, V]) peekLocked() (gobus.Event[K, V], bool) {
 	return gobus.Event[K, V]{Key: k, Value: rx.pending[k]}, true
 }
 
+// popAllLocked removes and returns every pending event in queue order, leaving
+// the receiver empty. Caller holds s.mu.
+//
+// Like popLocked, this deliberately does not delegate to peekLocked: it already
+// walks the elements it is removing, so delegating would cost a second elems
+// lookup per key under s.mu to recover what it holds.
+//
+// clear retains both maps' capacity, which is what a receiver that repeatedly
+// refills the same live key set wants; order.Init is list.List's reset. Nothing
+// references the old element chain once elems is cleared.
+func (rx *Receiver[K, V]) popAllLocked() []gobus.Event[K, V] {
+	n := rx.order.Len()
+	if n == 0 {
+		return nil
+	}
+	out := make([]gobus.Event[K, V], 0, n)
+	for e := rx.order.Front(); e != nil; e = e.Next() {
+		k := e.Value.(K)
+		out = append(out, gobus.Event[K, V]{Key: k, Value: rx.pending[k]})
+	}
+	rx.order.Init()
+	clear(rx.elems)
+	clear(rx.pending)
+	return out
+}
+
 // drainedLocked reports the terminal condition shared by every receive path:
 // the sender is closed and this receiver's queue is empty, so nothing can ever
 // arrive again. It is the single definition of "this stream is over" —
@@ -723,6 +749,47 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 		return ev, nil
 	}
 	return zero, gobus.ErrEmpty
+}
+
+// TryRecvAll pops every pending event without blocking and returns them in
+// queue order, leaving the receiver empty. It returns [gobus.ErrEmpty] if
+// nothing is pending.
+//
+// The whole queue is taken under one acquisition of the hub lock, and that
+// atomicity is the contract rather than an optimization: the result is
+// everything pending as of one instant. A loop of [Receiver.TryRecv] is a
+// sequence of instants, so the batch it assembles has no defined membership —
+// a Send landing between two iterations joins it and one landing just after
+// the loop observes empty does not, and no caller can close that gap from
+// outside the lock.
+//
+// Two properties of the returned slice are worth stating, because a batch
+// consumer will build on both. It is in **queue order**, which is first-touch
+// order and carries no relation to any ordering quantity inside V — a caller
+// that needs value order sorts what it gets. And it holds **one entry per
+// key**, since a receiver's queue holds each key once, so it can be folded
+// into a map or dispatched over per key without deduping. That second property
+// belongs to a single call: a batch assembled from more than one receive can
+// repeat a key, because an event that has already left the receiver's slots
+// cannot be coalesced into and a later Send for it enqueues afresh.
+//
+// The critical section is O(live keys) and runs no caller code — no [Merge],
+// no key filter — which is what makes holding the hub lock across the whole
+// queue acceptable. Note the trade against a TryRecv loop: total acquisitions
+// go down, but this one is held longer, so worst-case publisher latency goes
+// up.
+//
+// TryRecvAll is safe to call from any goroutine but, like the rest of the
+// receive side, is only meaningful on the receiver's single consuming
+// goroutine. An event already handed to the [Receiver.Chan] feeder has left
+// the queue, so a cut does not include it.
+func (rx *Receiver[K, V]) TryRecvAll() ([]gobus.Event[K, V], error) {
+	rx.s.mu.Lock()
+	defer rx.s.mu.Unlock()
+	if evs := rx.popAllLocked(); len(evs) > 0 {
+		return evs, nil
+	}
+	return nil, gobus.ErrEmpty
 }
 
 // Peek returns the oldest pending event without removing it, so a subsequent
