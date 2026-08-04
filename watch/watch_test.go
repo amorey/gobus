@@ -883,21 +883,38 @@ func TestFeederSkipsToTheCurrentValue(t *testing.T) {
 	rx := h.Watch("a", val{N: 0})
 	defer rx.Close()
 
-	// Sequence through the feeder's own hook: it fires after the feeder has
-	// snapshotted a value and before it enters the delivery select, so the
-	// replacement is deterministic rather than a race with the consumer. Arm
-	// it before Chan starts the feeder, or the write races the feeder's read.
+	// Sequence through the feeder's own hook, which fires on every park: the
+	// first is the snapshot of N:1, where the replacing Send lands, and the
+	// second is the re-snapshot it forces. The consumer is released only on
+	// that second one. Arm the hook before Chan starts the feeder, or the
+	// write races the feeder's read.
+	//
+	// Releasing the consumer on the *first* park is what made this flaky, and
+	// it fails the way this bus documents rather than by any defect: the
+	// replacing Send closes notify, so a consumer arriving at <-ch before the
+	// feeder reaches its select leaves both arms ready, and Go chooses between
+	// ready arms at random. Half those runs deliver the superseded N:1, which
+	// [Receiver.Chan] expressly permits — so R45 is only assertable in the
+	// window where nobody is waiting on the channel. Waiting for the
+	// re-snapshot puts us in it: notify is fresh by then, and the send to ch
+	// is the only arm that can fire.
 	replaced := make(chan struct{})
+	parks := 0 // feeder-goroutine-only, like the hook itself
 	rx.forTestingFeederParked = func() {
-		rx.forTestingFeederParked = nil
-		require.NoError(t, h.Sender().Send("a", val{N: 2}))
-		close(replaced)
+		parks++
+		switch parks {
+		case 1:
+			require.NoError(t, h.Sender().Send("a", val{N: 2}))
+		case 2:
+			close(replaced)
+		}
 	}
 	ch := rx.Chan()
 	require.NoError(t, h.Sender().Send("a", val{N: 1}))
 
 	<-replaced
 	assert.Equal(t, gobus.Event[string, val]{Key: "a", Value: val{N: 2}}, <-ch)
+	assert.Equal(t, 2, parks, "the feeder never re-snapshotted")
 }
 
 func TestFeederConvergesOnTheNewestValue(t *testing.T) {
