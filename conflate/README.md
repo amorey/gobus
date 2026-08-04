@@ -294,7 +294,17 @@ What is conflate-specific:
 | `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Receiver()` calls return pre-closed handles.                   |
 
 All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from
-another goroutine — it inherits the sender's close discipline.
+another goroutine — it tears down the receivers that send is fanning out to.
+
+`Sender.Close` **is** safe to call concurrently with a `Send` or `SendContext`
+from another goroutine. The two serialize, so a racing send resolves to exactly
+one of two outcomes — it publishes and returns `nil`, or it returns `ErrClosed`
+and publishes nothing. There is no third outcome and no partial one. Which
+ordering wins is unspecified: a caller that needs a value visible before
+shutdown must order the two itself, and a caller shutting down that doesn't care
+whether the last value lands needs no fence on its write path. This holds
+because `conflate`'s `Send` never parks; it is a promise about this package,
+not a module-wide rule.
 
 A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain
 deregisters itself from the hub, so a long-lived hub doesn't pin abandoned
