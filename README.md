@@ -176,7 +176,7 @@ Sender-close is the one termination that does not pre-empt a pending event: it i
 | `Receiver.Close()` | This handle only. Other receivers and the sender keep running; this handle's pending values are abandoned and its `Chan` feeder shuts down. |
 | `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Receiver()` / `Hub.Watch()` calls return pre-closed handles.  |
 
-All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from another goroutine — it inherits the sender's close discipline.
+All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from another goroutine — it tears down the receivers that send is fanning out to. `Sender.Close` is the exception: both packages make it safe to call concurrently with a `Send`, see [Thread safety](#thread-safety).
 
 A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain deregisters itself from the hub, so a long-lived hub doesn't pin abandoned receivers. On `watch` that tear-down also releases the key's state, so a key costs nothing once its last watcher has gone by either exit path.
 
@@ -185,6 +185,8 @@ On `watch`, `Sender.Close()` drains at most one value per receiver — its slot 
 ### Thread safety
 
 Both packages' `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock, and `Send` first reads a lock-free receiver count so it takes that lock only when a receiver is registered.
+
+That extends to closing while a send is in flight. Both packages promise `Sender.Close` is safe to call concurrently with a `Send` or `SendContext` from another goroutine: a racing send resolves to exactly one of two outcomes — it publishes and returns `nil`, or it returns `ErrClosed` and publishes nothing. There is no third outcome and no partial one, and which ordering wins is unspecified, so a caller that needs a value visible before shutdown must order the two itself. The promise holds because neither package's `Send` ever parks — the whole of `Close` runs under the hub lock, and the only step of a send outside it is the atomic load `Close` poisons. It is a promise about the two bus types that make it, not a rule a future one inherits, and it does **not** extend to `Hub.Close`, which keeps the discipline stated with the close table above.
 
 A `Receiver` is intended for a single consumer goroutine in both. `conflate` relies on it — the receiver owns an insertion-ordered queue meant to be popped by one reader. `watch` treats it as intent rather than invariant: a receiver using `Chan()` genuinely has two readers (the feeder and any direct `TryRecv`), so its read position lives under the hub lock rather than in the reading goroutine.
 
