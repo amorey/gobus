@@ -14,7 +14,7 @@ This library is a collection of common event bus architectures for Go. It's desi
 | Package                             | Senders | Receivers | Semantics                                                                        |
 | ----------------------------------- | ------- | --------- | -------------------------------------------------------------------------------- |
 | [`conflate`](./conflate/README.md)  | 1       | many      | Keyed latest-value fan-out: per-key coalescing via a caller-supplied merge.       |
-| [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key and holds its current value.        |
+| [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key (or all keys) and holds one slot.   |
 
 ## Installation
 
@@ -65,7 +65,7 @@ Highlights: per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to re
 
 ### Watch
 
-Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver watches exactly one key and holds one slot for it, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch.
+Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver holds one slot, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver for one key and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch. `Hub.WatchAcross` registers one for every key, still with a single slot.
 
 ```go
 hub := watch.New[ObjectID](watch.WithAccept(func(prev, next Stamped) bool {
@@ -86,7 +86,7 @@ for ev := range rx.Chan() {
 }
 ```
 
-Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — which is why wide subscriptions want `conflate` instead.
+Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — or every key, via `Hub.WatchAcross`, which still holds one slot and so collapses a burst across many keys into a single wake-up. A consumer that needs each key's *own* latest value wants `conflate` instead.
 
 **[Full documentation →](./watch/README.md)**
 

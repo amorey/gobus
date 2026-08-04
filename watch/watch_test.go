@@ -1056,3 +1056,235 @@ func TestSendContextCancelledOnEmptyHubTakesTheLock(t *testing.T) {
 	require.ErrorIs(t, h.Sender().SendContext(ctx, "a", val{N: 1}), context.Canceled)
 	assert.Equal(t, 1, locks, "a cancelled ctx falls through to the lock")
 }
+
+// --- Hub.WatchAcross: the receiver bound to every key ---------------------
+//
+// One slot is the contract here, not an artifact, so these read twice wherever
+// a single read would also pass against a per-key structure.
+
+func TestWatchAcrossReceivesEveryKey(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
+	require.NoError(t, tx.Send("b", val{N: 2}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "b", Value: val{N: 2}})
+}
+
+// TestWatchAcrossHoldsOneSlot is the contract, not an implementation artifact: a
+// burst across many keys leaves exactly one pending value, so a consumer whose
+// whole reaction is "go re-read the store" wakes once rather than once per key.
+//
+// The second read is what makes it a statement about cardinality rather than
+// about ordering. A per-key structure would satisfy the first assertion too,
+// by handing back "c" first and the rest afterwards.
+func TestWatchAcrossHoldsOneSlot(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1}))
+	require.NoError(t, tx.Send("b", val{N: 2}))
+	require.NoError(t, tx.Send("c", val{N: 3}))
+
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "c", Value: val{N: 3}})
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "the burst left more than one value")
+}
+
+// TestWatchAcrossEventKeyNamesTheValuesKey pins that the key travels with the
+// value rather than being the last key sent to. Only an accepted value moves
+// it, which is the same rule the value itself follows — a rejected send leaves
+// the slot entirely alone.
+func TestWatchAcrossEventKeyNamesTheValuesKey(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	rx := h.WatchAcross(val{N: 0, Seq: 5})
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1, Seq: 6}))
+	// Rejected: Seq 1 does not beat the slot's 6. If the key were written
+	// before Accept ran, or independently of it, this read would name "b".
+	require.NoError(t, tx.Send("b", val{N: 2, Seq: 1}))
+
+	assertPeek(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1, Seq: 6}})
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1, Seq: 6}})
+}
+
+func TestWatchAcrossDoesNotDeliverTheSeed(t *testing.T) {
+	// Registration is the snapshot, exactly as for Watch: initial is the
+	// caller's own baseline and the prev of the first Accept, never a delivery.
+	h := New[string](WithAccept(bySeq))
+	rx := h.WatchAcross(val{N: 1, Seq: 5})
+	_, err := rx.TryRecv()
+	require.ErrorIs(t, err, gobus.ErrEmpty)
+
+	// ...and it really is the baseline: a value that loses to it is rejected.
+	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 4}))
+	_, err = rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+}
+
+// TestWatchAcrossCoexistsWithSingleKeyReceivers pins both directions of the
+// routing: a send reaches the key's own watchers *and* every wildcard, and a
+// single-key receiver is unaffected by the wildcard's presence.
+func TestWatchAcrossCoexistsWithSingleKeyReceivers(t *testing.T) {
+	h := New[string, val]()
+	all := h.WatchAcross(val{N: 0})
+	a := h.Watch("a", val{N: 0})
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1}))
+	assertRecv(t, a, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
+	assertRecv(t, all, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
+
+	require.NoError(t, tx.Send("b", val{N: 2}))
+	assertRecv(t, all, gobus.Event[string, val]{Key: "b", Value: val{N: 2}})
+	_, err := a.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty, "a wildcard receiver widened a single-key one")
+}
+
+// TestWatchAcrossPinsNoKey holds the R5 guarantee up against the new receiver
+// kind: a key costs nothing once its last *watcher* has gone, and a wildcard
+// receiver is not a watcher of any particular key. Were it indexed under one —
+// its zero K, say — that key would be pinned for the receiver's whole life and
+// every send to it would fan out twice.
+func TestWatchAcrossPinsNoKey(t *testing.T) {
+	h := New[string, val]()
+	all := h.WatchAcross(val{N: 0})
+	require.Equal(t, 1, h.forTestingReceiverCount())
+	assert.Zero(t, h.forTestingKeyCount(), "a wildcard receiver pinned a key")
+
+	a := h.Watch("a", val{N: 0})
+	require.Equal(t, 1, h.forTestingKeyCount())
+	a.Close()
+	assert.Zero(t, h.forTestingKeyCount(), "the wildcard held a's state open")
+
+	all.Close()
+	assert.Zero(t, h.forTestingReceiverCount())
+}
+
+// TestWatchAcrossCloseDeregistersFromTheWildcardSet is the leak a receiver-count
+// assertion cannot see. A wildcard receiver left in s.wildcard is still offered
+// every value and still holds its slot, while every read on the handle reports
+// ErrClosed — so nothing observable through the handle would fail.
+func TestWatchAcrossCloseDeregistersFromTheWildcardSet(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	require.Equal(t, 1, h.forTestingWildcardCount())
+
+	rx.Close()
+	assert.Zero(t, h.forTestingWildcardCount())
+	assert.Zero(t, h.forTestingReceiverCount())
+	assert.Zero(t, h.forTestingLiveReceivers(), "the send fast path still sees a receiver")
+
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.NotPanics(t, rx.Close)
+}
+
+// TestWatchAcrossTerminalReadDeregisters is the other exit path: a receiver that
+// reaches ErrClosed by draining owes the same tear-down as one that is closed.
+func TestWatchAcrossTerminalReadDeregisters(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	tx := h.Sender()
+	require.NoError(t, tx.Send("a", val{N: 1}))
+	tx.Close()
+
+	// Sender.Close is the soft path, so the unread value comes back once...
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
+	_, err := rx.TryRecv()
+	require.ErrorIs(t, err, gobus.ErrClosed)
+
+	assert.Zero(t, h.forTestingWildcardCount())
+	assert.Zero(t, h.forTestingReceiverCount())
+}
+
+func TestWatchAcrossAfterHubCloseIsPreClosed(t *testing.T) {
+	h := New[string, val]()
+	h.Close()
+	rx := h.WatchAcross(val{N: 1})
+	require.NotNil(t, rx, "a pre-closed handle, never nil")
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+func TestHubCloseTearsDownWildcardReceivers(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	require.NoError(t, h.Sender().Send("a", val{N: 1}))
+
+	h.Close() // hard tear-down: no drain, even with a value unread
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+	assert.ErrorIs(t, h.Sender().Send("a", val{N: 2}), gobus.ErrClosed)
+}
+
+// TestWatchAcrossCountsTowardTheSendFastPath keeps the wildcard set from becoming
+// a second population the lock-free count does not know about. A hub whose only
+// receiver is a wildcard must not read as idle, or every send to it returns nil
+// and publishes nothing.
+func TestWatchAcrossCountsTowardTheSendFastPath(t *testing.T) {
+	h := New[string, val]()
+	require.Zero(t, h.forTestingLiveReceivers())
+
+	rx := h.WatchAcross(val{N: 0})
+	require.Equal(t, int64(1), h.forTestingLiveReceivers())
+	require.NoError(t, h.Sender().Send("a", val{N: 1}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
+}
+
+// TestWatchAcrossSenderCloseIsSafeConcurrentWithSend re-runs the promise
+// Sender.Close makes against the new receiver kind, through the same seam. The
+// promise is beehive's, cited by name, and the wildcard fan-out is new code on
+// the path it covers.
+func TestWatchAcrossSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
+	h := New[string, val]()
+	tx := h.Sender()
+	rx := h.WatchAcross(val{N: 1})
+
+	h.s.forTestingBeforeSendLock = func() { tx.Close() }
+	assert.ErrorIs(t, tx.Send("a", val{N: 2}), gobus.ErrClosed)
+	h.s.forTestingBeforeSendLock = nil
+
+	// Terminal at once, which is only true if nothing was published.
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrClosed)
+}
+
+// TestWatchAcrossChanDeliversAcrossKeys covers the feeder path, which builds its
+// event from the same slot the reading paths do — so the key it carries has to
+// move with the value there too.
+func TestWatchAcrossChanDeliversAcrossKeys(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	defer rx.Close()
+	ch := rx.Chan()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1}))
+	assert.Equal(t, gobus.Event[string, val]{Key: "a", Value: val{N: 1}}, <-ch)
+	require.NoError(t, tx.Send("b", val{N: 2}))
+	assert.Equal(t, gobus.Event[string, val]{Key: "b", Value: val{N: 2}}, <-ch)
+}
+
+// TestWatchAcrossRecvBlocksUntilAnyKeyLands pins the wake-up: a wildcard receiver
+// parked in Recv is woken by a send to a key it never named.
+func TestWatchAcrossRecvBlocksUntilAnyKeyLands(t *testing.T) {
+	h := New[string, val]()
+	rx := h.WatchAcross(val{N: 0})
+	tx := h.Sender()
+
+	evCh := make(chan gobus.Event[string, val], 1)
+	go func() {
+		ev, err := rx.Recv()
+		require.NoError(t, err)
+		evCh <- ev
+	}()
+	waitParked(t, rx, 1)
+
+	require.NoError(t, tx.Send("z", val{N: 9}))
+	assert.Equal(t, gobus.Event[string, val]{Key: "z", Value: val{N: 9}}, <-evCh)
+}

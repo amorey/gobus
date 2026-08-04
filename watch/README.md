@@ -1,6 +1,7 @@
 # watch
 
-*Keyed state bus: one receiver, one key, one slot — always the current value.*
+*Keyed state bus: one receiver, one key (or all of them), one slot — always the
+current value.*
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/amorey/gobus/watch.svg)](https://pkg.go.dev/github.com/amorey/gobus/watch)
 
@@ -16,7 +17,7 @@ import "github.com/amorey/gobus/watch"
 - [Quick start](#quick-start)
 - [Registration is the snapshot](#registration-is-the-snapshot)
 - [Accept decides which value wins](#accept-decides-which-value-wins)
-- [One key per receiver](#one-key-per-receiver)
+- [One key per receiver, or all of them](#one-key-per-receiver-or-all-of-them)
 - [Inspecting what is unread](#inspecting-what-is-unread)
 - [Publishing with no receivers](#publishing-with-no-receivers)
 - [Contexts and cancellation](#contexts-and-cancellation)
@@ -31,17 +32,19 @@ import "github.com/amorey/gobus/watch"
 
 Watch is a single-producer, multi-consumer keyed **state** bus. Where
 [`conflate`](../conflate/README.md) streams events, `watch` distributes the
-*current value* of a key: each `Receiver` watches exactly one key and holds
-**one slot** for it, so a slow consumer skips to the current value rather than
-replaying what it missed.
+*current value* of a key: each `Receiver` holds **one slot**, so a slow consumer
+skips to the current value rather than replaying what it missed.
 
 A receiver is created by `Hub.Watch`, which is also where its baseline comes
 from — the caller passes the value it has just read — and `Receiver.Close()` is
-the matching unwatch.
+the matching unwatch. `Hub.WatchAcross` makes one that watches every key instead of
+one, still with a single slot.
 
 Pick `watch` over `conflate` when a consumer follows a single object and only
-its current state matters. Pick `conflate` for wide subscriptions and for
-change streams where a create-then-delete pair must leave no residue.
+its current state matters, or when it reacts the same way to a change anywhere
+and wants one wake-up rather than one per key. Pick `conflate` when a consumer
+needs each key's own latest value, and for change streams where a
+create-then-delete pair must leave no residue.
 
 > **Coming from [`gochan/watch`](https://github.com/amorey/gochan)?** Two rules
 > differ. Registration here **does** snapshot (gochan's deliberately does not),
@@ -123,20 +126,70 @@ A rejected value changes nothing and the receiver is not told. A panic out of
 value, the rest are untouched, the send is not retried, and the hub stays
 usable.
 
-## One key per receiver
+## One key per receiver, or all of them
 
 There is no `Unwatch` and no key set: the constraint is structural, which is
-what removes the questions a mutable key set raises. A consumer watching N keys
-therefore holds N receivers and, if it uses `Chan()`, N goroutines — so `watch`
-is deliberately unsuited to wide subscriptions. A wide change-stream consumer
-wants [`conflate`](../conflate/README.md), which has the annihilation that a
-create-then-delete pair needs.
+what removes the questions a mutable key set raises. A consumer watching N
+particular keys therefore holds N receivers and, if it uses `Chan()`, N
+goroutines.
 
 `Send` for a key nobody watches is dropped, and nothing is retained: there is
 no receiver and therefore no buffer, so a later `Watch` never sees it. Once the
 last receiver for a key goes — by `Close` or by reaching a terminal
 `ErrClosed` — the hub releases the key entirely, so a key costs nothing after
 its last watcher.
+
+### WatchAcross
+
+`Hub.WatchAcross(initial)` is the one alternative: a receiver that watches **every
+key**, including keys nobody has published under yet and keys the consumer
+cannot name.
+
+```go
+rx := hub.WatchAcross(myBaseline)   // no key argument: there is no key to name
+defer rx.Close()
+
+for {
+    ev, err := rx.Recv()            // ev.Key names the key ev.Value came from
+    if err != nil {
+        return                    // ErrClosed
+    }
+    resync(ev.Key)
+}
+```
+
+**A wildcard subscription in the MQTT/NATS sense** is the closest model most
+callers arrive with, and it differs in the two ways you are most likely to
+assume rather than check:
+
+- **It does not deliver every matching value.** One slot means a value landing
+  while an earlier one is unread replaces it. You read the current value, never
+  the sequence.
+- **There is no pattern language.** Every key or nothing — no prefix, glob or
+  hierarchy, and nowhere to pass one. `K` is only `comparable`, so it carries no
+  structure to match against and no later release can add one.
+
+It is **not** a cheap way to subscribe to many keys. It holds one slot like
+every other receiver, so a burst across many keys collapses to a single pending
+value naming the last key to land — a hundred sends across fifty keys is one
+wake-up, not fifty, and the ninety-nine earlier values are never handed back.
+That collapse is the point: it serves a consumer whose reaction to any change is
+the same, typically "something moved, go re-read the store", and a wake per key
+would be pure waste to it. A consumer that needs each key's own latest value
+wants one `Watch` per key, or [`conflate`](../conflate/README.md), which keeps a
+slot per key and has the annihilation a create-then-delete pair needs.
+
+Everything else matches `Watch`. `initial` is the caller's own baseline and is
+never delivered back; registration calls no caller code, so it is safe under
+your own lock; `Accept` is evaluated against this receiver's own slot; and all
+three `Close` methods behave identically. `Event.Key` names the key the slot's
+value was published under, assigned when the value lands — a value your `Accept`
+rejects moves neither the value nor the key.
+
+Two structural differences worth knowing. A wildcard receiver holds no key
+against the hub, so it does not keep per-key state alive: a key still costs
+nothing once its last `Watch` receiver has gone. And with one registered the hub
+has no unwatched key, so no `Send` is dropped for want of a receiver.
 
 ## Inspecting what is unread
 
@@ -156,11 +209,12 @@ a closed handle gets `ErrClosed` even with a value waiting. If you want the
 current state on demand, keep your own copy of the last value read — the
 reading goroutine already has it, and it costs no lock.
 
-Between two `Peek`s the key is fixed, since a receiver watches one key for
-life, but the value is not: a `Send` your `Accept` takes replaces the slot, so
+Between two `Peek`s the value is not fixed: a `Send` your `Accept` takes replaces the slot, so
 the second `Peek` reports the newer value and the older one is never handed
 back by either path. That is the same skip-ahead every read on this bus is
-subject to, only visible without consuming.
+subject to, only visible without consuming. For a `Watch` receiver the key *is*
+fixed, since it watches one key for life; for a `WatchAcross` receiver the key
+travels with the value, so a replacing value can change it too.
 
 Two cautions, as on `conflate`. `Peek` takes the same hub lock that serializes
 the entire `Send` fan-out, so polling it in a loop degrades every publisher and
@@ -312,6 +366,7 @@ only `K`.
 ```go
 func (h *Hub[K, V]) Sender() *Sender[K, V]
 func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V]
+func (h *Hub[K, V]) WatchAcross(initial V) *Receiver[K, V]
 func (h *Hub[K, V]) Close()
 ```
 
@@ -319,6 +374,11 @@ func (h *Hub[K, V]) Close()
 one. `Watch` makes a receiver for `k` seeded with `initial` as the baseline;
 after `Hub.Close` the returned handle is pre-closed, and after `Sender.Close`
 it is live but holds nothing unread.
+
+`WatchAcross` makes a receiver for *every* key, seeded the same way. It holds one
+slot like any other receiver — the latest value published under any key, and the
+key it came from — so a burst across many keys leaves one pending value. See
+[WatchAcross](#watchacross).
 
 ### Accept
 

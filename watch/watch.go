@@ -1,10 +1,11 @@
 // Package watch provides a keyed latest-value state bus.
 //
-// A [Hub] hands out a singleton [Sender] and any number of [Receiver]s. Each
-// receiver watches exactly one key, and [Hub.Watch] is how one is made:
-// [Receiver.Close] is the matching unwatch. A [Sender.Send] for a key reaches
-// every receiver watching it, and a receiver that falls behind skips to the
-// current value rather than replaying what it missed.
+// A [Hub] hands out a singleton [Sender] and any number of [Receiver]s. A
+// receiver watches exactly one key, made by [Hub.Watch], or every key, made by
+// [Hub.WatchAcross]; [Receiver.Close] is the matching unwatch for either. A
+// [Sender.Send] for a key reaches every receiver watching it, and a receiver
+// that falls behind skips to the current value rather than replaying what it
+// missed.
 //
 // # Registration is the snapshot
 //
@@ -20,14 +21,24 @@
 // closed > value precedence the taking paths use — so it too reports nothing
 // for a receiver still on its baseline.
 //
-// # One key for each receiver
+// # One key for each receiver, or all of them
 //
-// There is no Unwatch and no mutable key set — the constraint is structural. A
-// consumer watching N keys therefore holds N receivers and, if it uses
-// [Receiver.Chan], N goroutines, so this package is deliberately unsuited to
-// wide subscriptions. A wide change-stream consumer wants
-// github.com/amorey/gobus/conflate, which has the annihilation a
-// create-then-delete pair needs.
+// [Hub.Watch] binds a receiver to its key for life. There is no Unwatch and no
+// mutable key set — the constraint is structural, so a consumer watching N
+// particular keys holds N receivers and, if it uses [Receiver.Chan], N
+// goroutines.
+//
+// [Hub.WatchAcross] is the one alternative: a receiver that watches every key,
+// including keys nobody has published under yet and keys the consumer cannot
+// name. It is not a way to subscribe to many keys cheaply — it still holds one
+// slot, so a burst across many keys collapses to a single pending value naming
+// the last key to land. That collapse is the point. It serves a consumer whose
+// reaction to any change is the same, typically "go re-read the store", and it
+// serves it in one wake-up rather than one per key.
+//
+// A consumer that needs each key's own latest value, or the annihilation a
+// create-then-delete pair needs, wants github.com/amorey/gobus/conflate, which
+// keeps a slot per key and filters at enqueue.
 package watch
 
 import (
@@ -90,9 +101,19 @@ type shared[K comparable, V any] struct {
 	accept Accept[V] // nil = accept every value
 
 	// index is the send-side lookup, so a Send touches only the receivers
-	// watching its key. receivers is the whole set, for Hub.Close and for the
-	// O(1) length live is synced from. Both are mutated at the same sites.
+	// watching its key. wildcard holds the receivers minted by [Hub.WatchAcross],
+	// which watch every key and so cannot be indexed by one; a send fans out to
+	// index[k] and then to all of wildcard. receivers is the whole set, for
+	// Hub.Close and for the O(1) length live is synced from. All three are
+	// mutated at the same sites, and a receiver is in exactly one of index and
+	// wildcard.
+	//
+	// wildcard is a second map rather than a reserved entry in index because
+	// index's keys are the hub's live key set — the thing deregisterLocked
+	// bounds and forTestingKeyCount reads. A wildcard receiver pins no key, so
+	// it must not be able to appear in that set.
 	index     map[K]map[*Receiver[K, V]]struct{}
+	wildcard  map[*Receiver[K, V]]struct{}
 	receivers map[*Receiver[K, V]]struct{}
 
 	txClosed  bool
@@ -115,25 +136,33 @@ type shared[K comparable, V any] struct {
 	forTestingBeforeSendLock func()
 }
 
-// registerLocked adds rx to both maps. Caller holds s.mu.
+// registerLocked adds rx to the whole-set map and to whichever send-side map
+// routes to it. Caller holds s.mu.
 func (s *shared[K, V]) registerLocked(rx *Receiver[K, V]) {
-	set := s.index[rx.key]
-	if set == nil {
-		set = make(map[*Receiver[K, V]]struct{})
-		s.index[rx.key] = set
+	if rx.wildcard {
+		s.wildcard[rx] = struct{}{}
+	} else {
+		set := s.index[rx.key]
+		if set == nil {
+			set = make(map[*Receiver[K, V]]struct{})
+			s.index[rx.key] = set
+		}
+		set[rx] = struct{}{}
 	}
-	set[rx] = struct{}{}
 	s.receivers[rx] = struct{}{}
 	s.live.Sync(len(s.receivers))
 }
 
-// deregisterLocked drops rx from both maps, removing the key entirely once no
-// receiver watches it — which is what bounds hub memory by the live watch set.
-// It rides with [Receiver.Close] and with every terminal verdict, so a key
-// costs nothing once its last watcher has gone by either path. Caller holds
-// s.mu.
+// deregisterLocked drops rx from the whole-set map and from whichever send-side
+// map holds it, removing the key entirely once no receiver watches it — which
+// is what bounds hub memory by the live watch set. It rides with
+// [Receiver.Close] and with every terminal verdict, so a key costs nothing once
+// its last watcher has gone by either path. A wildcard receiver holds no key,
+// so it neither keeps one alive nor releases one here. Caller holds s.mu.
 func (s *shared[K, V]) deregisterLocked(rx *Receiver[K, V]) {
-	if set := s.index[rx.key]; set != nil {
+	if rx.wildcard {
+		delete(s.wildcard, rx)
+	} else if set := s.index[rx.key]; set != nil {
 		delete(set, rx)
 		if len(set) == 0 {
 			delete(s.index, rx.key)
@@ -161,6 +190,7 @@ func New[K comparable, V any](opts ...Option[V]) *Hub[K, V] {
 	s := &shared[K, V]{
 		accept:    cfg.accept,
 		index:     make(map[K]map[*Receiver[K, V]]struct{}),
+		wildcard:  make(map[*Receiver[K, V]]struct{}),
 		receivers: make(map[*Receiver[K, V]]struct{}),
 	}
 	return &Hub[K, V]{s: s, tx: &Sender[K, V]{s: s}}
@@ -186,7 +216,58 @@ func (h *Hub[K, V]) Sender() *Sender[K, V] { return h.tx }
 // After [Hub.Close] the returned handle is pre-closed. After [Sender.Close] it
 // is live but holds nothing unread, so its first read is terminal.
 func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
-	rx := &Receiver[K, V]{s: h.s, key: k, val: initial, notify: make(chan struct{})}
+	return h.watch(k, false, initial)
+}
+
+// WatchAcross makes a receiver watching every key — every key the hub carries
+// now and every key it ever will — holding one slot, like every other receiver
+// on this bus. That slot is the latest value published under *any* key, plus
+// the key it came from. initial is the value the caller has just read, exactly
+// as for [Hub.Watch].
+//
+// A wildcard subscription in the MQTT or NATS sense is the closest model most
+// callers arrive with, and it differs in the two ways most likely to be assumed
+// rather than checked:
+//
+//   - It does not deliver every matching value. One slot means a value that
+//     lands while an earlier one is still unread replaces it, so what a
+//     consumer reads is the current value, never the sequence. A burst across
+//     fifty keys is one wake-up, not fifty. If that loses information the
+//     consumer needs, this is the wrong method — see below.
+//   - There is no pattern language. It matches every key or nothing; there is
+//     no prefix, glob or hierarchy, and there is nowhere to pass one. K is
+//     merely comparable, so it carries no structure to match against and no
+//     later release can add one.
+//
+// One slot is the contract, not an artifact of how the slot is written. A burst
+// across many keys leaves exactly one value pending, so a consumer whose whole
+// reaction is "something changed, go re-read the store" wakes once rather than
+// once per key. A consumer that needs each key's own latest value wants one
+// [Hub.Watch] per key, or github.com/amorey/gobus/conflate — which keeps a slot
+// per key and has the annihilation a create-then-delete pair needs.
+//
+// [gobus.Event.Key] names the key the slot's value was published under,
+// assigned when a value lands. A value the hub's [Accept] rejects changes
+// neither the value nor the key, since the slot still holds what it held
+// before. A receiver still on its baseline has no key at all — it has read
+// nothing — which is unobservable, because every read reports [gobus.ErrEmpty]
+// until a value lands.
+//
+// Everything else matches [Hub.Watch]: initial is the caller's own baseline and
+// is never delivered back, no caller code runs during registration, and the
+// close behavior of all three Close methods is the same. It differs in holding
+// no key against the hub — a wildcard receiver keeps no per-key state alive, so
+// a key still costs nothing once its last [Hub.Watch] receiver has gone.
+func (h *Hub[K, V]) WatchAcross(initial V) *Receiver[K, V] {
+	var zero K
+	return h.watch(zero, true, initial)
+}
+
+// watch mints and registers a receiver. It is the one place a handle is built,
+// so the two constructors cannot drift on seeding, on the pre-closed case, or
+// on the ordering that makes registration a snapshot.
+func (h *Hub[K, V]) watch(k K, wildcard bool, initial V) *Receiver[K, V] {
+	rx := &Receiver[K, V]{s: h.s, key: k, wildcard: wildcard, val: initial, notify: make(chan struct{})}
 	rx.done.Init()
 	h.s.mu.Lock()
 	if h.s.hubClosed {
@@ -229,14 +310,17 @@ func (h *Hub[K, V]) Close() {
 	}
 	s.receivers = nil
 	s.index = nil
+	s.wildcard = nil
 }
 
 // Sender is the singleton send-side handle. Safe to share across goroutines.
 type Sender[K comparable, V any] struct{ s *shared[K, V] }
 
-// Send publishes v as the value of k to every receiver watching k. Never
-// blocks. A Send for a key nobody watches is discarded: there is no receiver
-// and therefore no buffer, so a later [Hub.Watch] never sees it.
+// Send publishes v as the value of k to every receiver watching k, and to every
+// receiver from [Hub.WatchAcross]. Never blocks. A Send for a key nobody watches
+// is discarded: there is no receiver and therefore no buffer, so a later
+// [Hub.Watch] never sees it. A wildcard receiver is a watcher of every key, so
+// a hub with one has no unwatched key.
 //
 // For each watching receiver the hub's [Accept] decides whether v replaces
 // that receiver's current value. A rejected value changes nothing, and the
@@ -372,19 +456,33 @@ func (s *shared[K, V]) sendLocked(ctxDone <-chan struct{}, k K, v V) (cancelled 
 		return true, nil
 	default:
 	}
+	// The key's own watchers, then every wildcard. A receiver is in exactly one
+	// of the two maps, so neither loop can offer the same value twice, and a
+	// hub with no wildcard receiver pays one empty range for the second.
 	for rx := range s.index[k] {
-		rx.offerLocked(v)
+		rx.offerLocked(k, v)
+	}
+	for rx := range s.wildcard {
+		rx.offerLocked(k, v)
 	}
 	return false, nil
 }
 
-// Receiver is a receive-side handle watching exactly one key, intended for one
-// consumer goroutine. It holds a single slot rather than a queue: a value that
-// [Accept] takes overwrites the one before it, so a slow reader skips to the
-// current value instead of building a backlog.
+// Receiver is a receive-side handle, intended for one consumer goroutine. It
+// watches exactly one key, or every key when minted by [Hub.WatchAcross]. Either
+// way it holds a single slot rather than a queue: a value that [Accept] takes
+// overwrites the one before it, so a slow reader skips to the current value
+// instead of building a backlog.
 type Receiver[K comparable, V any] struct {
-	s   *shared[K, V]
-	key K
+	s *shared[K, V]
+
+	// key is the key this receiver watches, and wildcard says which of the two
+	// kinds it is. For a wildcard receiver key is instead the key of the value
+	// currently in the slot, written by offerLocked as the value lands and
+	// meaningless until one does; wildcard itself is set at construction and
+	// never written again, so no read of it needs s.mu.
+	key      K
+	wildcard bool
 
 	// val is the current value and version counts the values Accept has taken.
 	// lastSeen is the read position: val is unread exactly while version >
@@ -429,12 +527,19 @@ type Receiver[K comparable, V any] struct {
 	forTestingFeederExit        func()
 }
 
-// offerLocked puts v to this receiver's Accept and takes it on a true result.
-// Caller holds s.mu.
-func (rx *Receiver[K, V]) offerLocked(v V) {
+// offerLocked puts v, published under k, to this receiver's Accept and takes it
+// on a true result. Caller holds s.mu.
+//
+// A wildcard receiver's key travels with its value: the key is written here,
+// alongside the value it names, and only when Accept takes it. A rejected value
+// leaves the slot exactly as it was, key included, so the pair a read hands
+// back is always the one that landed together. For a single-key receiver k is
+// its own key by construction and the write is a no-op.
+func (rx *Receiver[K, V]) offerLocked(k K, v V) {
 	if rx.s.accept != nil && !rx.s.accept(rx.val, v) {
 		return
 	}
+	rx.key = k
 	rx.val = v
 	rx.version++
 	rx.signalLocked()
@@ -531,11 +636,13 @@ func (rx *Receiver[K, V]) TryRecv() (gobus.Event[K, V], error) {
 // copy of the last value read if you need the current state on demand — that
 // is what the reading goroutine already has, and it costs no lock.
 //
-// Between two Peeks the key is fixed — a receiver watches one key for its
-// whole life — but the value is not: a [Sender.Send] this receiver's [Accept]
-// takes replaces the slot, so the second Peek reports the newer value and the
-// older one is never handed back by either path. That is the same skip-ahead
-// every read on this bus is subject to, only visible without consuming.
+// Between two Peeks the value is not fixed: a [Sender.Send] this receiver's
+// [Accept] takes replaces the slot, so the second Peek reports the newer value
+// and the older one is never handed back by either path. That is the same
+// skip-ahead every read on this bus is subject to, only visible without
+// consuming. For a receiver from [Hub.Watch] the key *is* fixed, since it
+// watches one key for its whole life; for one from [Hub.WatchAcross] the key
+// travels with the value, so a replacing value can change it too.
 //
 // Peek takes the hub lock, the same one that serializes the whole Send
 // fan-out, so polling it in a loop slows every publisher and every other
