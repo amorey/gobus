@@ -60,7 +60,9 @@ environment issue, not a code issue, and does not affect CI (Linux).
   suite. It drives handles through the shared interfaces, not concrete types,
   and pins the close/cancel/value precedence the interface docs promise on
   every bus type's behalf. A new bus package means a new row in
-  `architectures`; if it can't pass, the interface doc is wrong and has to
+  `architectures`, and so does a new *receiver kind* reached by its own
+  registration and routing paths but handed back as the same `gobus.Receiver` —
+  `watch(across)` is the worked example. If it can't pass, the interface doc is wrong and has to
   change with it. This is the only place a bus that resolves the ordering its
   own way fails — per-package tests can't see it, since such a bus still looks
   internally consistent.
@@ -81,7 +83,12 @@ environment issue, not a code issue, and does not affect CI (Linux).
   unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
   evaluated per receiver against that receiver's own slot. See
   `docs/adr/2026-08-01-watch-keyed-state-bus.md` for why it exists and what was
-  rejected on the way.
+  rejected on the way. `hub.WatchAcross(initial)` mints the other receiver kind —
+  bound to every key, still one slot, so a burst across many keys collapses to
+  one pending value naming the last key to land. Wildcards live in
+  `shared.wildcard`, deliberately *not* as an entry in `index`: `index`'s key
+  set is the hub's live key set, and a receiver pinning no key must not be able
+  to appear in it. See `docs/adr/2026-08-04-watch-watchacross.md`.
 - `internal/buscore/` — shared building blocks, not part of the public API.
   `CloseOnce` (atomic flag + done channel), used for the lock-free closed
   pre-check on every receive path, and `LiveCount` (the poisoned send-fast-path

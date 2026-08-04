@@ -481,6 +481,24 @@ func (tx *Sender[K, V]) SendContext(ctx context.Context, k K, v V) error {
 // subsequent reads return [gobus.ErrClosed], and their Chan feeders close the
 // channel after the same drain. Further Send calls return ErrClosed.
 // Idempotent.
+//
+// Safe to call concurrently with a [Sender.Send] or [Sender.SendContext] from
+// another goroutine. The two serialize on the one state every send path reads
+// without the bus lock — the poisoned live count — so a racing send resolves to
+// exactly one of the two orderings: it publishes and returns nil, or it returns
+// ErrClosed and publishes nothing. There is no third outcome and no partial
+// one. *Which* ordering wins is unspecified, so a caller that needs a send to
+// be visible before shutdown must order the two itself; a caller shutting down
+// and not caring whether the last value lands need not fence anything. A send
+// that wins the ordering is still drained by this soft close, so "publishes"
+// means the value reaches its receivers, not merely that it was enqueued
+// before a tear-down discarded it.
+//
+// This is a promise about conflate specifically, and it holds because Send
+// never parks: the whole of Close runs under s.mu, and the only step of a send
+// that runs outside it is the atomic load Close poisons. Do not read it as a
+// module-wide rule — [Hub.Close] keeps the close-versus-send discipline stated
+// in its own doc, since it tears down receivers a send is fanning out to.
 func (tx *Sender[K, V]) Close() {
 	s := tx.s
 	s.mu.Lock()

@@ -69,6 +69,26 @@ var architectures = []architecture{
 			return h.Sender(), h.Watch(key, 0)
 		},
 	},
+	{
+		// A second row for one package, which the rule "a bus type is a row"
+		// does not by itself call for. watch.Hub.WatchAcross mints a receiver of a
+		// different kind — bound to every key rather than one — reached by its
+		// own registration and send-routing paths, and it is handed to callers
+		// as the same gobus.Receiver. The precedence it owes is therefore the
+		// interface's, not watch's, and this is where that is stated. A row is
+		// the cheapest way to keep the two kinds from drifting apart.
+		name: "watch(across)",
+		key:  1,
+		newPair: func(t *testing.T, _ int) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
+			t.Helper()
+			h := watch.New[int, int]()
+			t.Cleanup(h.Close)
+			// The key is ignored: a wildcard receiver takes whatever the suite
+			// publishes, which is what makes the negative assertions here
+			// non-vacuous without threading a key in.
+			return h.Sender(), h.WatchAcross(0)
+		},
+	},
 }
 
 // TestSendContextPrecedenceConformance pins the send side: closed > cancelled.

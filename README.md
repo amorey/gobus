@@ -14,7 +14,7 @@ This library is a collection of common event bus architectures for Go. It's desi
 | Package                             | Senders | Receivers | Semantics                                                                        |
 | ----------------------------------- | ------- | --------- | -------------------------------------------------------------------------------- |
 | [`conflate`](./conflate/README.md)  | 1       | many      | Keyed latest-value fan-out: per-key coalescing via a caller-supplied merge.       |
-| [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key and holds its current value.        |
+| [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key (or all keys) and holds one slot.   |
 
 ## Installation
 
@@ -65,7 +65,7 @@ Highlights: per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to re
 
 ### Watch
 
-Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver watches exactly one key and holds one slot for it, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch.
+Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver holds one slot, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver for one key and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch. `Hub.WatchAcross` registers one for every key, still with a single slot.
 
 ```go
 hub := watch.New[ObjectID](watch.WithAccept(func(prev, next Stamped) bool {
@@ -86,7 +86,7 @@ for ev := range rx.Chan() {
 }
 ```
 
-Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — which is why wide subscriptions want `conflate` instead.
+Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — or every key, via `Hub.WatchAcross`, which still holds one slot and so collapses a burst across many keys into a single wake-up. A consumer that needs each key's *own* latest value wants `conflate` instead.
 
 **[Full documentation →](./watch/README.md)**
 
@@ -176,7 +176,7 @@ Sender-close is the one termination that does not pre-empt a pending event: it i
 | `Receiver.Close()` | This handle only. Other receivers and the sender keep running; this handle's pending values are abandoned and its `Chan` feeder shuts down. |
 | `Hub.Close()`      | Hard tear-down: sender plus every live receiver, with no drain. Future `Hub.Receiver()` / `Hub.Watch()` calls return pre-closed handles.  |
 
-All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from another goroutine — it inherits the sender's close discipline.
+All idempotent. Don't call `Hub.Close` concurrently with an active `Send` from another goroutine — it tears down the receivers that send is fanning out to. `Sender.Close` is the exception: both packages make it safe to call concurrently with a `Send`, see [Thread safety](#thread-safety).
 
 A receiver that reaches the terminal `ErrClosed` after a `Sender.Close` drain deregisters itself from the hub, so a long-lived hub doesn't pin abandoned receivers. On `watch` that tear-down also releases the key's state, so a key costs nothing once its last watcher has gone by either exit path.
 
@@ -185,6 +185,8 @@ On `watch`, `Sender.Close()` drains at most one value per receiver — its slot 
 ### Thread safety
 
 Both packages' `Sender` is safe to share across goroutines: `Send` and `Close` both serialize through the hub lock, and `Send` first reads a lock-free receiver count so it takes that lock only when a receiver is registered.
+
+That extends to closing while a send is in flight. Both packages promise `Sender.Close` is safe to call concurrently with a `Send` or `SendContext` from another goroutine: a racing send resolves to exactly one of two outcomes — it publishes and returns `nil`, or it returns `ErrClosed` and publishes nothing. There is no third outcome and no partial one, and which ordering wins is unspecified, so a caller that needs a value visible before shutdown must order the two itself. The promise holds because neither package's `Send` ever parks — the whole of `Close` runs under the hub lock, and the only step of a send outside it is the atomic load `Close` poisons. It is a promise about the two bus types that make it, not a rule a future one inherits, and it does **not** extend to `Hub.Close`, which keeps the discipline stated with the close table above.
 
 A `Receiver` is intended for a single consumer goroutine in both. `conflate` relies on it — the receiver owns an insertion-ordered queue meant to be popped by one reader. `watch` treats it as intent rather than invariant: a receiver using `Chan()` genuinely has two readers (the feeder and any direct `TryRecv`), so its read position lives under the hub lock rather than in the reading goroutine.
 
