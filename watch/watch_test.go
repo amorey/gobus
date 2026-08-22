@@ -59,17 +59,105 @@ func TestSenderIsASingleton(t *testing.T) {
 }
 
 func TestWatchDoesNotDeliverTheSeed(t *testing.T) {
-	// R19: initial is the caller's own argument. It is the baseline for
-	// Accept, not a value to hand back.
+	// R19: the baseline is the caller's own argument. It is the prev of the
+	// first Accept, not a value to hand back.
 	h := New[string](WithAccept(bySeq))
-	rx := h.Watch("a", val{N: 1, Seq: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 1}))
 	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+}
+
+func TestWatchPanicsOnNilOption(t *testing.T) {
+	// Watch takes ...WatchOption[K, V], so Watch("a", nil) is legal Go.
+	h := New[string, val]()
+	assert.PanicsWithValue(t, "gobus: watch.Hub.Watch received a nil WatchOption", func() {
+		h.Watch("a", nil)
+	})
+}
+
+func TestWatchAcrossPanicsOnNilOption(t *testing.T) {
+	h := New[string, val]()
+	assert.PanicsWithValue(t, "gobus: watch.Hub.Watch received a nil WatchOption", func() {
+		h.WatchAcross(nil)
+	})
+}
+
+// TestNoBaselineTakesTheFirstValueUnjudged pins what omitting WithBaseline
+// means. bySeq would reject this value against any baseline at or above Seq 5,
+// including the zero val the receiver would hold if the slot were simply seeded
+// empty — so a hub that invented a prev fails here.
+func TestNoBaselineTakesTheFirstValueUnjudged(t *testing.T) {
+	h := New[string](WithAccept(func(prev, next val) bool {
+		require.Fail(t, "Accept must not run against an empty slot")
+		return false
+	}))
+	rx := h.Watch("a")
+	require.NoError(t, h.Sender().Send("a", val{N: 7, Seq: 0}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 7, Seq: 0}})
+}
+
+// TestNoBaselineJudgesEveryValueAfterTheFirst pins the other half: the slot
+// holds a value from the first send on, so Accept governs from the second.
+func TestNoBaselineJudgesEveryValueAfterTheFirst(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	rx := h.Watch("a")
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send("a", val{N: 1, Seq: 5})) // taken unjudged
+	require.NoError(t, tx.Send("a", val{N: 2, Seq: 4})) // loses to Seq 5
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1, Seq: 5}})
+
+	require.NoError(t, tx.Send("a", val{N: 3, Seq: 6})) // beats Seq 5
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 3, Seq: 6}})
+}
+
+// TestWithBaselineTakesTheZeroValue pins the zero V as a usable baseline:
+// hasBaseline carries the "set" bit, so a receiver based at the zero val must
+// judge against it rather than take the first value unjudged.
+func TestWithBaselineTakesTheZeroValue(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	rx := h.Watch("a", h.WithBaseline(val{}))
+	// Seq 0 does not beat the zero baseline's Seq 0, so nothing lands.
+	require.NoError(t, h.Sender().Send("a", val{N: 7, Seq: 0}))
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+}
+
+// TestWatchAcrossWithoutBaselineTakesTheFirstValue pins the wildcard receiver
+// on the same rule, including the key that travels with that first value.
+func TestWatchAcrossWithoutBaselineTakesTheFirstValue(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	rx := h.WatchAcross()
+	require.NoError(t, h.Sender().Send("b", val{N: 4, Seq: 0}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "b", Value: val{N: 4, Seq: 0}})
+}
+
+// TestLastBaselineWins pins the option-application order Watch promises.
+func TestLastBaselineWins(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 9}), h.WithBaseline(val{N: 2, Seq: 1}))
+	// Seq 5 loses to the first baseline and beats the second.
+	require.NoError(t, h.Sender().Send("a", val{N: 3, Seq: 5}))
+	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 3, Seq: 5}})
+}
+
+// TestBaselineIsPerReceiver pins why the baseline is an option on Watch rather
+// than on the hub: two receivers on one key register at different instants and
+// judge the same value against their own reads.
+func TestBaselineIsPerReceiver(t *testing.T) {
+	h := New[string](WithAccept(bySeq))
+	behind := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 1}))
+	ahead := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 9}))
+
+	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 5}))
+	assertRecv(t, behind, gobus.Event[string, val]{Key: "a", Value: val{N: 2, Seq: 5}})
+	_, err := ahead.TryRecv()
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
 }
 
 func TestTryRecvIsEmptyUntilSomethingChanges(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	for i := 0; i < 3; i++ {
 		_, err := rx.TryRecv()
 		require.ErrorIs(t, err, gobus.ErrEmpty)
@@ -78,7 +166,7 @@ func TestTryRecvIsEmptyUntilSomethingChanges(t *testing.T) {
 
 func TestReceiverCloseIsTheUnwatch(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.Equal(t, 1, h.forTestingReceiverCount())
 	require.Equal(t, 1, h.forTestingKeyCount())
 
@@ -90,7 +178,7 @@ func TestReceiverCloseIsTheUnwatch(t *testing.T) {
 
 func TestReceiverCloseIsIdempotent(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	rx.Close()
 	assert.NotPanics(t, rx.Close)
 	_, err := rx.TryRecv()
@@ -99,8 +187,8 @@ func TestReceiverCloseIsIdempotent(t *testing.T) {
 
 func TestKeyStateSurvivesWhileAnotherReceiverWatches(t *testing.T) {
 	h := New[string, val]()
-	a := h.Watch("k", val{N: 1})
-	b := h.Watch("k", val{N: 1})
+	a := h.Watch("k", h.WithBaseline(val{N: 1}))
+	b := h.Watch("k", h.WithBaseline(val{N: 1}))
 	require.Equal(t, 1, h.forTestingKeyCount())
 
 	a.Close()
@@ -112,7 +200,7 @@ func TestKeyStateSurvivesWhileAnotherReceiverWatches(t *testing.T) {
 func TestWatchAfterHubCloseIsPreClosed(t *testing.T) {
 	h := New[string, val]()
 	h.Close()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NotNil(t, rx, "R23: a pre-closed handle, never nil")
 	_, err := rx.TryRecv()
 	assert.ErrorIs(t, err, gobus.ErrClosed)
@@ -136,7 +224,7 @@ func assertPeek(t *testing.T, rx *Receiver[string, val], want gobus.Event[string
 
 func TestSendReachesTheWatchingReceiver(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
 }
@@ -144,7 +232,7 @@ func TestSendReachesTheWatchingReceiver(t *testing.T) {
 func TestSendForAnUnwatchedKeyIsDropped(t *testing.T) {
 	// R43c: no receiver means no buffer. A later Watch never sees it.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("b", val{N: 9}))
 
 	_, err := rx.TryRecv()
@@ -154,8 +242,8 @@ func TestSendForAnUnwatchedKeyIsDropped(t *testing.T) {
 
 func TestSendOnlyTouchesItsOwnKey(t *testing.T) {
 	h := New[string, val]()
-	a := h.Watch("a", val{N: 1})
-	b := h.Watch("b", val{N: 1})
+	a := h.Watch("a", h.WithBaseline(val{N: 1}))
+	b := h.Watch("b", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	assertRecv(t, a, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
@@ -166,7 +254,7 @@ func TestSendOnlyTouchesItsOwnKey(t *testing.T) {
 func TestAcceptRejectsAValueAndTheReceiverNeverLearns(t *testing.T) {
 	// R9: a false result changes nothing, silently.
 	h := New[string](WithAccept(bySeq))
-	rx := h.Watch("a", val{N: 1, Seq: 5})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 5}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 4}))
 
 	_, err := rx.TryRecv()
@@ -177,8 +265,8 @@ func TestAcceptRunsPerReceiverAgainstItsOwnSlot(t *testing.T) {
 	// R10: two receivers of one key seeded at different moments. One value is
 	// new for the older seed and stale for the newer one.
 	h := New[string](WithAccept(bySeq))
-	behind := h.Watch("k", val{N: 1, Seq: 3})
-	ahead := h.Watch("k", val{N: 1, Seq: 7})
+	behind := h.Watch("k", h.WithBaseline(val{N: 1, Seq: 3}))
+	ahead := h.Watch("k", h.WithBaseline(val{N: 1, Seq: 7}))
 
 	require.NoError(t, h.Sender().Send("k", val{N: 2, Seq: 5}))
 
@@ -189,7 +277,7 @@ func TestAcceptRunsPerReceiverAgainstItsOwnSlot(t *testing.T) {
 
 func TestTheDefaultAcceptTakesEveryValue(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1, Seq: 9})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 9}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 1}))
 	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2, Seq: 1}})
 }
@@ -197,7 +285,7 @@ func TestTheDefaultAcceptTakesEveryValue(t *testing.T) {
 func TestAnUnreadValueIsOverwrittenNotQueued(t *testing.T) {
 	// R26: a slow reader skips to the current value.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 	for i := 1; i <= 3; i++ {
 		require.NoError(t, h.Sender().Send("a", val{N: i}))
 	}
@@ -209,7 +297,7 @@ func TestAnUnreadValueIsOverwrittenNotQueued(t *testing.T) {
 
 func TestTrySendIsSend(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().TrySend("a", val{N: 2}))
 	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
 }
@@ -224,8 +312,8 @@ func TestAcceptPanicReleasesTheLockAndLeavesAPartialFanOut(t *testing.T) {
 		}
 		return true
 	}))
-	first := h.Watch("k", val{N: 0})
-	second := h.Watch("k", val{N: 0})
+	first := h.Watch("k", h.WithBaseline(val{N: 0}))
+	second := h.Watch("k", h.WithBaseline(val{N: 0}))
 
 	boom = true
 	assert.PanicsWithValue(t, "accept exploded", func() {
@@ -258,7 +346,7 @@ func waitParked(t *testing.T, rx *Receiver[string, val], n int) {
 
 func TestRecvReturnsAnAlreadyUnreadValue(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	ev, err := rx.Recv()
@@ -268,7 +356,7 @@ func TestRecvReturnsAnAlreadyUnreadValue(t *testing.T) {
 
 func TestRecvBlocksUntilASendLands(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 	got := make(chan gobus.Event[string, val], 1)
 	go func() {
@@ -284,7 +372,7 @@ func TestRecvBlocksUntilASendLands(t *testing.T) {
 
 func TestRecvIgnoresARejectedValueAndStaysParked(t *testing.T) {
 	h := New[string](WithAccept(bySeq))
-	rx := h.Watch("a", val{N: 1, Seq: 5})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 5}))
 
 	got := make(chan gobus.Event[string, val], 1)
 	go func() {
@@ -301,7 +389,7 @@ func TestRecvIgnoresARejectedValueAndStaysParked(t *testing.T) {
 
 func TestRecvOnAClosedReceiverIsTerminal(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	rx.Close()
 
 	_, err := rx.Recv()
@@ -319,7 +407,7 @@ func TestEveryCloseWakesAParkedReader(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := New[string, val]()
-			rx := h.Watch("a", val{N: 1})
+			rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 			done := make(chan error, 1)
 			go func() {
@@ -336,7 +424,7 @@ func TestEveryCloseWakesAParkedReader(t *testing.T) {
 
 func TestParkedReadersLeaveNoWaiterBehind(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 	done := make(chan struct{})
 	go func() {
@@ -357,7 +445,7 @@ func TestParkedReadersLeaveNoWaiterBehind(t *testing.T) {
 func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
 	// R38: the unread value survives the soft close.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 	h.Sender().Close()
 
@@ -368,7 +456,7 @@ func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
 
 func TestSenderCloseWithNothingUnreadIsTerminalAtOnce(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	h.Sender().Close()
 
 	_, err := rx.Recv()
@@ -403,7 +491,7 @@ func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 	t.Run("close lands first", func(t *testing.T) {
 		h := New[string, val]()
 		tx := h.Sender()
-		rx := h.Watch("a", val{N: 1})
+		rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 		h.s.forTestingBeforeSendLock = func() { tx.Close() }
 		assert.ErrorIs(t, tx.Send("a", val{N: 2}), gobus.ErrClosed)
@@ -418,7 +506,7 @@ func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 	t.Run("send lands first", func(t *testing.T) {
 		h := New[string, val]()
 		tx := h.Sender()
-		rx := h.Watch("a", val{N: 1})
+		rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 		require.NoError(t, tx.Send("a", val{N: 2}))
 		tx.Close()
@@ -433,7 +521,7 @@ func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 func TestSenderCloseIsSafeConcurrentWithSendContext(t *testing.T) {
 	h := New[string, val]()
 	tx := h.Sender()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 	h.s.forTestingBeforeSendLock = func() { tx.Close() }
 	assert.ErrorIs(t, tx.SendContext(context.Background(), "a", val{N: 2}), gobus.ErrClosed)
@@ -467,7 +555,7 @@ func TestTerminalErrClosedDropsTheKey(t *testing.T) {
 	for name, read := range reads {
 		t.Run(name, func(t *testing.T) {
 			h := New[string, val]()
-			rx := h.Watch("a", val{N: 1})
+			rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 			h.Sender().Close()
 
 			require.ErrorIs(t, read(rx), gobus.ErrClosed)
@@ -480,7 +568,7 @@ func TestTerminalErrClosedDropsTheKey(t *testing.T) {
 func TestHubCloseIsHardTearDown(t *testing.T) {
 	// R39: no drain, even with a value unread.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 	h.Close()
 
@@ -495,7 +583,7 @@ func TestWatchAfterSenderCloseIsLiveButTerminal(t *testing.T) {
 	// unread, so its first read is terminal.
 	h := New[string, val]()
 	h.Sender().Close()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.False(t, rx.done.IsClosed(), "live handle, not pre-closed")
 
 	_, err := rx.TryRecv()
@@ -506,7 +594,7 @@ func TestWatchAfterSenderCloseIsLiveButTerminal(t *testing.T) {
 func TestAnIdleReceiverPinsItsKey(t *testing.T) {
 	// R43b: R5 is a guarantee about closed receivers, not idle ones.
 	h := New[string, val]()
-	_ = h.Watch("a", val{N: 1})
+	_ = h.Watch("a", h.WithBaseline(val{N: 1}))
 	assert.Equal(t, 1, h.forTestingKeyCount())
 }
 
@@ -523,7 +611,7 @@ func TestCloseRaceIsResolvedUnderTheLock(t *testing.T) {
 	// The lock-free rx.done pre-check can go stale; the re-check under s.mu is
 	// what makes "close wins" correct rather than best-effort.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	rx.forTestingBeforeTryRecvLock = func() { rx.Close() }
@@ -533,7 +621,7 @@ func TestCloseRaceIsResolvedUnderTheLock(t *testing.T) {
 
 func TestCloseRaceIsResolvedUnderTheLockForRecv(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	rx.forTestingBeforeRecvLock = func() { rx.Close() }
@@ -545,7 +633,7 @@ func TestPeekDoesNotConsume(t *testing.T) {
 	// Two Peeks report the same value while nothing supersedes it, and it is
 	// still there for the read that actually takes it.
 	h := New[string](WithAccept(bySeq))
-	rx := h.Watch("a", val{N: 1, Seq: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1, Seq: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2, Seq: 2}))
 
 	want := gobus.Event[string, val]{Key: "a", Value: val{N: 2, Seq: 2}}
@@ -565,7 +653,7 @@ func TestPeekReportsWhatIsUnreadNotTheCurrentState(t *testing.T) {
 	// Peek is TryRecv minus the take, not a read of the key's state: the
 	// baseline is not peekable, and neither is a value already taken.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 
 	_, err := rx.Peek()
 	require.ErrorIs(t, err, gobus.ErrEmpty, "the baseline is not a delivery")
@@ -590,7 +678,7 @@ func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := New[string, val]()
-			rx := h.Watch("a", val{N: 1})
+			rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 			require.NoError(t, h.Sender().Send("a", val{N: 2}))
 			tc.close(h, rx)
 
@@ -605,7 +693,7 @@ func TestPeekDrainsThenReportsClosed(t *testing.T) {
 	// Sender.Close is the soft path, so the final value is still peekable —
 	// and peeking it does not consume it.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 	h.Sender().Close()
 
@@ -622,7 +710,7 @@ func TestPeekDrainsThenReportsClosed(t *testing.T) {
 
 func TestPeekCloseRaceIsResolvedUnderTheLock(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	rx.forTestingBeforePeekLock = func() { rx.Close() }
@@ -635,7 +723,7 @@ func TestPeekCloseRaceIsResolvedUnderTheLock(t *testing.T) {
 // so the value it is holding is still unread and Peek reports it.
 func TestPeekSeesTheValueInFlightToTheFeeder(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	defer rx.Close()
 
 	// The hook runs on the feeder goroutine, so the result is carried back to
@@ -668,7 +756,7 @@ var peekSink gobus.Event[string, val]
 
 func TestPeekAllocatesNothing(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	// Three field reads and a struct return: nothing to allocate.
@@ -679,7 +767,7 @@ func TestPeekAllocatesNothing(t *testing.T) {
 
 func TestRecvContextReturnsAValue(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	ev, err := rx.RecvContext(context.Background())
@@ -690,7 +778,7 @@ func TestRecvContextReturnsAValue(t *testing.T) {
 func TestRecvContextCancelBeatsAnUnreadValue(t *testing.T) {
 	// R36: cancellation outranks a ready value, and does not consume it.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().Send("a", val{N: 2}))
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -704,7 +792,7 @@ func TestRecvContextCancelBeatsAnUnreadValue(t *testing.T) {
 
 func TestRecvContextCancelWakesAParkedReader(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
@@ -721,7 +809,7 @@ func TestRecvContextCancelWakesAParkedReader(t *testing.T) {
 func TestRecvContextCancelDoesNotCloseTheReceiver(t *testing.T) {
 	// R37: ctx.Err() is not an end of stream.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -735,7 +823,7 @@ func TestRecvContextCancelDoesNotCloseTheReceiver(t *testing.T) {
 
 func TestClosedBeatsCancelledOnTheReceiveSide(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	rx.Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -746,7 +834,7 @@ func TestClosedBeatsCancelledOnTheReceiveSide(t *testing.T) {
 
 func TestDrainedSenderCloseBeatsCancelled(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	h.Sender().Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -762,7 +850,7 @@ func TestParkedCloseAndCancelResolveToClosed(t *testing.T) {
 	// the receiver first lets the reader leave the select before ctxDone
 	// exists, and the arm under test is never taken.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	done := make(chan error, 1)
@@ -782,14 +870,14 @@ func TestParkedCloseAndCancelResolveToClosed(t *testing.T) {
 
 func TestSendContextPublishes(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	require.NoError(t, h.Sender().SendContext(context.Background(), "a", val{N: 2}))
 	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 2}})
 }
 
 func TestSendContextCancelledDoesNotPublish(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
@@ -800,7 +888,7 @@ func TestSendContextCancelledDoesNotPublish(t *testing.T) {
 
 func TestClosedBeatsCancelledOnTheSendSide(t *testing.T) {
 	h := New[string, val]()
-	_ = h.Watch("a", val{N: 1})
+	_ = h.Watch("a", h.WithBaseline(val{N: 1}))
 	h.Sender().Close()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -812,7 +900,7 @@ func TestSendContextChecksCancellationAtTheLockNotAtEntry(t *testing.T) {
 	// R35: nothing is published for a context that expired while the send was
 	// waiting for the lock.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ctx, cancel := context.WithCancel(context.Background())
 
 	h.s.forTestingBeforeSendLock = cancel
@@ -825,7 +913,7 @@ func TestSendContextChecksCancellationAtTheLockNotAtEntry(t *testing.T) {
 
 func TestChanDeliversValues(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	defer rx.Close()
 
 	ch := rx.Chan()
@@ -835,14 +923,14 @@ func TestChanDeliversValues(t *testing.T) {
 
 func TestChanIsTheSameChannelEveryTime(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	defer rx.Close()
 	assert.Equal(t, rx.Chan(), rx.Chan())
 }
 
 func TestChanClosesOnReceiverClose(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	ch := rx.Chan()
 
 	rx.Close()
@@ -853,7 +941,7 @@ func TestChanClosesOnReceiverClose(t *testing.T) {
 func TestChanClosesAfterSenderCloseDrains(t *testing.T) {
 	// R46: the final value first, then the close.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	defer rx.Close()
 	ch := rx.Chan()
 
@@ -867,7 +955,7 @@ func TestChanClosesAfterSenderCloseDrains(t *testing.T) {
 
 func TestChanClosesOnHubClose(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 1})
+	rx := h.Watch("a", h.WithBaseline(val{N: 1}))
 	defer rx.Close()
 	ch := rx.Chan()
 
@@ -880,7 +968,7 @@ func TestFeederSkipsToTheCurrentValue(t *testing.T) {
 	// R45: a value that lands while the feeder is parked on delivery replaces
 	// the one waiting, so a slow consumer reads the current value.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 	defer rx.Close()
 
 	// Sequence through the feeder's own hook, which fires on every park: the
@@ -922,7 +1010,7 @@ func TestFeederConvergesOnTheNewestValue(t *testing.T) {
 	// ends on the current value. R45c permits the superseded one to arrive
 	// first, so this must not assert that it does not.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 	defer rx.Close()
 	ch := rx.Chan()
 
@@ -941,7 +1029,7 @@ func TestFeederCloseWhileDeliveringDoesNotLeak(t *testing.T) {
 	// Both arms of the delivery select can be ready at once. Sequence with the
 	// exit hook rather than letting a waiting reader make the choice random.
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 
 	exited := make(chan struct{})
 	rx.forTestingFeederExit = func() { close(exited) }
@@ -962,7 +1050,7 @@ func TestFeederCloseWhileDeliveringDoesNotLeak(t *testing.T) {
 
 func TestFeederCloseRaceIsResolvedUnderTheLock(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 
 	exited := make(chan struct{})
 	rx.forTestingFeederExit = func() { close(exited) }
@@ -997,7 +1085,7 @@ func TestSendSkipsTheLockWithNoReceiver(t *testing.T) {
 
 func TestSendTakesTheLockOnceAReceiverExists(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 	defer rx.Close()
 
 	var locks int
@@ -1008,7 +1096,7 @@ func TestSendTakesTheLockOnceAReceiverExists(t *testing.T) {
 
 func TestTheFastPathReturnsAfterTheLastReceiverLeaves(t *testing.T) {
 	h := New[string, val]()
-	rx := h.Watch("a", val{N: 0})
+	rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 	require.EqualValues(t, 1, h.forTestingLiveReceivers())
 
 	rx.Close()
@@ -1032,7 +1120,7 @@ func TestClosedHubsStayOnTheLockedPath(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := New[string, val]()
-			rx := h.Watch("a", val{N: 0})
+			rx := h.Watch("a", h.WithBaseline(val{N: 0}))
 			tc.close(h)
 			rx.Close()
 
@@ -1081,7 +1169,7 @@ func TestSendContextCancelledOnEmptyHubTakesTheLock(t *testing.T) {
 
 func TestWatchAcrossReceivesEveryKey(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	tx := h.Sender()
 
 	require.NoError(t, tx.Send("a", val{N: 1}))
@@ -1099,7 +1187,7 @@ func TestWatchAcrossReceivesEveryKey(t *testing.T) {
 // by handing back "c" first and the rest afterwards.
 func TestWatchAcrossHoldsOneSlot(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	tx := h.Sender()
 
 	require.NoError(t, tx.Send("a", val{N: 1}))
@@ -1117,7 +1205,7 @@ func TestWatchAcrossHoldsOneSlot(t *testing.T) {
 // the slot entirely alone.
 func TestWatchAcrossEventKeyNamesTheValuesKey(t *testing.T) {
 	h := New[string](WithAccept(bySeq))
-	rx := h.WatchAcross(val{N: 0, Seq: 5})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0, Seq: 5}))
 	tx := h.Sender()
 
 	require.NoError(t, tx.Send("a", val{N: 1, Seq: 6}))
@@ -1133,7 +1221,7 @@ func TestWatchAcrossDoesNotDeliverTheSeed(t *testing.T) {
 	// Registration is the snapshot, exactly as for Watch: initial is the
 	// caller's own baseline and the prev of the first Accept, never a delivery.
 	h := New[string](WithAccept(bySeq))
-	rx := h.WatchAcross(val{N: 1, Seq: 5})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 1, Seq: 5}))
 	_, err := rx.TryRecv()
 	require.ErrorIs(t, err, gobus.ErrEmpty)
 
@@ -1148,8 +1236,8 @@ func TestWatchAcrossDoesNotDeliverTheSeed(t *testing.T) {
 // single-key receiver is unaffected by the wildcard's presence.
 func TestWatchAcrossCoexistsWithSingleKeyReceivers(t *testing.T) {
 	h := New[string, val]()
-	all := h.WatchAcross(val{N: 0})
-	a := h.Watch("a", val{N: 0})
+	all := h.WatchAcross(h.WithBaseline(val{N: 0}))
+	a := h.Watch("a", h.WithBaseline(val{N: 0}))
 	tx := h.Sender()
 
 	require.NoError(t, tx.Send("a", val{N: 1}))
@@ -1169,11 +1257,11 @@ func TestWatchAcrossCoexistsWithSingleKeyReceivers(t *testing.T) {
 // every send to it would fan out twice.
 func TestWatchAcrossPinsNoKey(t *testing.T) {
 	h := New[string, val]()
-	all := h.WatchAcross(val{N: 0})
+	all := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	require.Equal(t, 1, h.forTestingReceiverCount())
 	assert.Zero(t, h.forTestingKeyCount(), "a wildcard receiver pinned a key")
 
-	a := h.Watch("a", val{N: 0})
+	a := h.Watch("a", h.WithBaseline(val{N: 0}))
 	require.Equal(t, 1, h.forTestingKeyCount())
 	a.Close()
 	assert.Zero(t, h.forTestingKeyCount(), "the wildcard held a's state open")
@@ -1188,7 +1276,7 @@ func TestWatchAcrossPinsNoKey(t *testing.T) {
 // ErrClosed — so nothing observable through the handle would fail.
 func TestWatchAcrossCloseDeregistersFromTheWildcardSet(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	require.Equal(t, 1, h.forTestingWildcardCount())
 
 	rx.Close()
@@ -1205,7 +1293,7 @@ func TestWatchAcrossCloseDeregistersFromTheWildcardSet(t *testing.T) {
 // reaches ErrClosed by draining owes the same tear-down as one that is closed.
 func TestWatchAcrossTerminalReadDeregisters(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	tx := h.Sender()
 	require.NoError(t, tx.Send("a", val{N: 1}))
 	tx.Close()
@@ -1222,7 +1310,7 @@ func TestWatchAcrossTerminalReadDeregisters(t *testing.T) {
 func TestWatchAcrossAfterHubCloseIsPreClosed(t *testing.T) {
 	h := New[string, val]()
 	h.Close()
-	rx := h.WatchAcross(val{N: 1})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 1}))
 	require.NotNil(t, rx, "a pre-closed handle, never nil")
 	_, err := rx.TryRecv()
 	assert.ErrorIs(t, err, gobus.ErrClosed)
@@ -1230,7 +1318,7 @@ func TestWatchAcrossAfterHubCloseIsPreClosed(t *testing.T) {
 
 func TestHubCloseTearsDownWildcardReceivers(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	require.NoError(t, h.Sender().Send("a", val{N: 1}))
 
 	h.Close() // hard tear-down: no drain, even with a value unread
@@ -1247,7 +1335,7 @@ func TestWatchAcrossCountsTowardTheSendFastPath(t *testing.T) {
 	h := New[string, val]()
 	require.Zero(t, h.forTestingLiveReceivers())
 
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	require.Equal(t, int64(1), h.forTestingLiveReceivers())
 	require.NoError(t, h.Sender().Send("a", val{N: 1}))
 	assertRecv(t, rx, gobus.Event[string, val]{Key: "a", Value: val{N: 1}})
@@ -1260,7 +1348,7 @@ func TestWatchAcrossCountsTowardTheSendFastPath(t *testing.T) {
 func TestWatchAcrossSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 	h := New[string, val]()
 	tx := h.Sender()
-	rx := h.WatchAcross(val{N: 1})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 1}))
 
 	h.s.forTestingBeforeSendLock = func() { tx.Close() }
 	assert.ErrorIs(t, tx.Send("a", val{N: 2}), gobus.ErrClosed)
@@ -1276,7 +1364,7 @@ func TestWatchAcrossSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 // move with the value there too.
 func TestWatchAcrossChanDeliversAcrossKeys(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	defer rx.Close()
 	ch := rx.Chan()
 	tx := h.Sender()
@@ -1291,7 +1379,7 @@ func TestWatchAcrossChanDeliversAcrossKeys(t *testing.T) {
 // parked in Recv is woken by a send to a key it never named.
 func TestWatchAcrossRecvBlocksUntilAnyKeyLands(t *testing.T) {
 	h := New[string, val]()
-	rx := h.WatchAcross(val{N: 0})
+	rx := h.WatchAcross(h.WithBaseline(val{N: 0}))
 	tx := h.Sender()
 
 	evCh := make(chan gobus.Event[string, val], 1)

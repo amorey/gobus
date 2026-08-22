@@ -36,8 +36,8 @@ Watch is a single-producer, multi-consumer keyed **state** bus. Where
 skips to the current value rather than replaying what it missed.
 
 A receiver is created by `Hub.Watch`, which is also where its baseline comes
-from — the caller passes the value it has just read — and `Receiver.Close()` is
-the matching unwatch. `Hub.WatchAcross` makes one that watches every key instead of
+from — `Hub.WithBaseline` passes the value the caller has just read — and
+`Receiver.Close()` is the matching unwatch. `Hub.WatchAcross` makes one that watches every key instead of
 one, still with a single slot.
 
 Pick `watch` over `conflate` when a consumer follows a single object and only
@@ -63,7 +63,7 @@ defer hub.Close()
 // caller code, so it is safe under your own lock.
 q.mu.Lock()
 cur := q.current(id)
-rx := hub.Watch(id, cur)
+rx := hub.Watch(id, hub.WithBaseline(cur))
 q.mu.Unlock()
 defer rx.Close()
 
@@ -77,9 +77,24 @@ Note the type arguments: `watch.New[ObjectID]` spells only `K`, because
 
 ## Registration is the snapshot
 
-`Watch` takes the value you have just read and **never hands it back** — it is
-the baseline, not a delivery. It is the `prev` of the first `Accept` call, and
-a receiver reads a value only once a `Send` supersedes it.
+`WithBaseline` takes the value you have just read and **never hands it back** —
+it is the baseline, not a delivery. It is the `prev` of the first `Accept` call,
+and a receiver reads a value only once a `Send` supersedes it.
+
+Omit it and the receiver has no baseline: it has read nothing and holds nothing,
+so its **first value is taken whatever it is**, without consulting `Accept`.
+There is no `prev` to pass, and the zero `V` would be a value you never held —
+seeding it silently changes which first value wins. `Accept` governs every value
+after that.
+
+```go
+rx := hub.Watch(id)                          // any current value will do
+rx := hub.Watch(id, hub.WithBaseline(cur))   // measure against what I just read
+```
+
+The baseline is per receiver, not per hub, because each consumer reads at its
+own instant. `WithAccept` — the rule those values are judged by — is hub-wide
+for the opposite reason.
 
 Because `Watch` calls no caller code, you can read your state and register in
 one critical section, which removes the register-before-read ordering rule
@@ -141,7 +156,7 @@ its last watcher.
 
 ### WatchAcross
 
-`Hub.WatchAcross(initial)` is the one alternative: a receiver that watches **every
+`Hub.WatchAcross()` is the one alternative: a receiver that watches **every
 key**, including keys nobody has published under yet and keys the consumer
 cannot name.
 
@@ -179,8 +194,11 @@ would be pure waste to it. A consumer that needs each key's own latest value
 wants one `Watch` per key, or [`conflate`](../conflate/README.md), which keeps a
 slot per key and has the annihilation a create-then-delete pair needs.
 
-Everything else matches `Watch`. `initial` is the caller's own baseline and is
-never delivered back; registration calls no caller code, so it is safe under
+Everything else matches `Watch`. It takes the same options: without one the
+first value is taken unjudged, and a `WithBaseline` value is the caller's own
+baseline and is never delivered back — a wildcard baseline being a prior value
+with no key attached, since you read it before knowing which key would move
+next; registration calls no caller code, so it is safe under
 your own lock; `Accept` is evaluated against this receiver's own slot; and all
 three `Close` methods behave identically. `Event.Key` names the key the slot's
 value was published under, assigned when the value lands — a value your `Accept`
@@ -365,17 +383,23 @@ only `K`.
 
 ```go
 func (h *Hub[K, V]) Sender() *Sender[K, V]
-func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V]
-func (h *Hub[K, V]) WatchAcross(initial V) *Receiver[K, V]
+func (h *Hub[K, V]) Watch(k K, opts ...WatchOption[K, V]) *Receiver[K, V]
+func (h *Hub[K, V]) WatchAcross(opts ...WatchOption[K, V]) *Receiver[K, V]
+func (h *Hub[K, V]) WithBaseline(cur V) WatchOption[K, V]
 func (h *Hub[K, V]) Close()
 ```
 
 `Sender` returns the singleton send-side handle; repeated calls return the same
-one. `Watch` makes a receiver for `k` seeded with `initial` as the baseline;
-after `Hub.Close` the returned handle is pre-closed, and after `Sender.Close`
-it is live but holds nothing unread.
+one. `Watch` makes a receiver for `k`; after `Hub.Close` the returned handle is
+pre-closed, and after `Sender.Close` it is live but holds nothing unread.
 
-`WatchAcross` makes a receiver for *every* key, seeded the same way. It holds one
+`WithBaseline` seeds the receiver's slot with the value the caller has just
+read, making it the `prev` of the first `Accept`. Without it the receiver holds
+nothing and takes its first value unjudged. The zero `V` is a usable baseline.
+Both constructors panic on a nil option; `WithBaseline` takes a value, so it has
+nothing to reject.
+
+`WatchAcross` makes a receiver for *every* key, taking the same options. It holds one
 slot like any other receiver — the latest value published under any key, and the
 key it came from — so a burst across many keys leaves one pending value. See
 [WatchAcross](#watchacross).

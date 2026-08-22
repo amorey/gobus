@@ -113,11 +113,15 @@ A `UserPromptSubmit` hook (`scripts/writing-standards-hook.sh`, wired in `.claud
   coalescing latest-wins unless `WithDefaultMerge` says otherwise; handles come
   from `hub.Sender()` and `hub.Receiver(opts...)`.
 - `watch/` — keyed latest-value **state** bus. One receiver watches one key,
-  seeded by the caller at `hub.Watch(k, initial)`; `Receiver.Close` is the
-  unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
-  evaluated per receiver against that receiver's own slot. See
+  optionally seeded by the caller at `hub.Watch(k, hub.WithBaseline(cur))`;
+  `Receiver.Close` is the unwatch. A caller `Accept(prev, next) bool` decides
+  which of two values wins, evaluated per receiver against that receiver's own
+  slot — but never against an empty one: a receiver registered with no baseline
+  takes its first value unjudged, since there is no prev to pass and the zero
+  `V` is a value the caller never held. `hasValue` on the receiver carries that
+  bit. See
   `docs/adr/2026-08-01-watch-keyed-state-bus.md` for why it exists and what was
-  rejected on the way. `hub.WatchAcross(initial)` mints the other receiver kind —
+  rejected on the way. `hub.WatchAcross(opts...)` mints the other receiver kind —
   bound to every key, still one slot, so a burst across many keys collapses to
   one pending value naming the last key to land. Wildcards live in
   `shared.wildcard`, deliberately *not* as an entry in `index`: `index`'s key

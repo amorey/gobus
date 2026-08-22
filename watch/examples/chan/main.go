@@ -82,7 +82,7 @@ func (b *builder) advance(job string, pct int) {
 func (b *builder) watchJob(job string) (*watch.Receiver[string, Progress], Progress) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.hub.Watch(job, b.state[job]), b.state[job]
+	return b.hub.Watch(job, b.hub.WithBaseline(b.state[job])), b.state[job]
 }
 
 func main() {
