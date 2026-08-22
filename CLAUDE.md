@@ -54,6 +54,29 @@ with `dyld: missing LC_UUID load command` because 1.21's internal linker omits
 that command; add `-ldflags=-linkmode=external` to run them. That is an
 environment issue, not a code issue, and does not affect CI (Linux).
 
+## Pull requests
+
+`.github/pull_request_template.md` is the required body format. `gh pr create`
+does **not** apply it — the template is a GitHub *web form* feature, and the CLI
+sends whatever `--body` says — so read the file and fill its sections in by
+hand. Every PR body carries `## Summary` (the why) and `## Key Changes` (the
+what), and the title carries the emoji the template's comment block lists: 🎣
+bug fix, 🐋 new feature, 📜 documentation, ✨ general improvement, ahead of the
+conventional-commit prefix (`🐋 feat(conflate)!: …`).
+
+```console
+gh pr create --title "<emoji> <type>(<scope>): <subject>" --body-file <path>
+```
+
+`--body-file` over an inline heredoc: the body is long, and a file is what you
+can re-read and re-`PATCH` if the create half-fails. `gh pr edit` can fail on
+this repo with a Projects-classic GraphQL deprecation error and leave the PR
+untouched; `gh api -X PATCH repos/amorey/gobus/pulls/<n> --input <json>` is the
+way through.
+
+Push over HTTPS. `origin` is an SSH remote, which a sandbox cannot authenticate
+— `git push https://github.com/amorey/gobus.git <branch>`.
+
 ## Writing standards
 
 1. **Code — simple, idiomatic, easy for a human to follow.** Prefer the boring construction. Match the idiom of the file you are in over the one you would pick on a blank page. Cleverness that needs a comment to survive review is usually the wrong trade.
