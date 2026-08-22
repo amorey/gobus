@@ -45,10 +45,10 @@ var architectures = []architecture{
 		key:  1,
 		newPair: func(t *testing.T, _ int) (gobus.Sender[int, int], gobus.Receiver[int, int]) {
 			t.Helper()
-			// latest-wins, never annihilating: the simplest policy that keeps
-			// these tests about precedence rather than about coalescing. A
-			// conflate receiver takes every key, so it ignores the key.
-			h := conflate.New[int](func(_, next int) (int, bool) { return next, true })
+			// The default merge is latest-wins and never annihilates, which
+			// keeps these tests about precedence rather than about coalescing.
+			// A conflate receiver takes every key, so it ignores the key.
+			h := conflate.New[int, int]()
 			t.Cleanup(h.Close)
 			return h.Sender(), h.Receiver()
 		},

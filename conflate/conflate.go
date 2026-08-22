@@ -11,10 +11,11 @@
 // it catches up to the latest value of every key, in first-touch order, and
 // its memory stays bounded by the live key set rather than by write volume.
 //
-// Coalescing policy is supplied by the caller as a [Merge] function so the bus
-// stays domain-agnostic: Merge decides how an undelivered pending value
-// combines with a newly sent one, and may annihilate the slot entirely (e.g. a
-// create followed by a delete the consumer never observed).
+// Coalescing policy is a [Merge] function, deciding how an undelivered pending
+// value combines with a newly sent one. By default the newer value wins, which
+// is latest-value-per-key. [WithDefaultMerge] supplies another for a bus that
+// must combine values rather than replace them, or annihilate the slot entirely
+// (e.g. a create followed by a delete the consumer never observed).
 //
 // # Typical uses
 //
@@ -59,7 +60,9 @@
 // actually wants. [Hub.WithMerge] lets a single consumer coalesce by its own
 // policy without affecting the rest of the bus — necessary when consumers of
 // the same producer disagree about what may be dropped, since one hub-wide
-// Merge cannot express that. The options compose.
+// merge cannot express that. The options compose. [WithDefaultMerge] sets the
+// hub's fallback at construction; [Hub.WithMerge] overrides it for one
+// receiver.
 //
 // The backlog head is observable without consuming it. [Receiver.Peek]
 // returns the oldest pending event and leaves it in place, under the same
@@ -95,6 +98,36 @@ import (
 // Merge is called under the bus lock, so it must not call back into the hub.
 type Merge[V any] func(prev, next V) (merged V, keep bool)
 
+// latest is the hub's merge when [WithDefaultMerge] is absent, installed by
+// [New] rather than left nil — so the fallback a receiver resolves to is always
+// a real function.
+func latest[V any](_, next V) (V, bool) { return next, true }
+
+// Option configures a hub built by [New]. It is package-level, unlike the
+// per-receiver options, because it is built before the hub exists.
+//
+// It carries V alone, so a call site spells only K. A K-dependent option would
+// force both type arguments at every such call site; don't add one without
+// meaning to.
+type Option[V any] func(*config[V])
+
+// config accumulates the options applied to a hub. A zero config is the
+// default hub: latest-wins coalescing.
+type config[V any] struct {
+	merge Merge[V]
+}
+
+// WithDefaultMerge sets the hub-wide coalescing policy: the merge every
+// receiver uses unless [Hub.WithMerge] gave it one of its own. Without it the
+// hub keeps the newer value, which is latest-value-per-key. Panics if merge is
+// nil. See docs/adr/2026-08-22-conflate-default-merge.md.
+func WithDefaultMerge[V any](merge Merge[V]) Option[V] {
+	if merge == nil {
+		panic("gobus: conflate.WithDefaultMerge requires a non-nil Merge")
+	}
+	return func(c *config[V]) { c.merge = merge }
+}
+
 // ReceiverOption configures a receiver minted by [Hub.Receiver]. Options are
 // built by the hub's own [Hub.WithKeyFilter] and [Hub.WithMerge] methods,
 // which fix K and V from the hub — so option call sites need no type arguments
@@ -116,8 +149,12 @@ type receiverConfig[K comparable, V any] struct {
 // read pops from its own, so one lock keeps enqueue/coalesce/pop consistent
 // without per-receiver locking races.
 type shared[K comparable, V any] struct {
-	mu        sync.Mutex
-	merge     Merge[V]
+	mu sync.Mutex
+
+	// merge is the hub-wide fallback, never nil — New resolves the default, so
+	// enqueueLocked needs no second nil check behind the receiver's own.
+	merge Merge[V]
+
 	receivers map[*Receiver[K, V]]struct{}
 	txClosed  bool
 	hubClosed bool
@@ -210,12 +247,23 @@ type Receiver[K comparable, V any] struct {
 	forTestingFeederExit       func()
 }
 
-// New creates a hub whose receivers coalesce per key using merge. It panics if
-// merge is nil — the coalescing policy is the whole point of the bus, so there
-// is no implicit default.
-func New[K comparable, V any](merge Merge[V]) *Hub[K, V] {
+// New creates a hub whose receivers coalesce per key. Without options a Send
+// for a key that is already pending replaces the undelivered value, which is
+// latest-value-per-key. [WithDefaultMerge] sets a different hub-wide policy —
+// one that combines values (summing deltas, unioning sets) or annihilates them.
+//
+// Panics if any option is nil.
+func New[K comparable, V any](opts ...Option[V]) *Hub[K, V] {
+	var cfg config[V]
+	for _, opt := range opts {
+		if opt == nil {
+			panic("gobus: conflate.New received a nil Option")
+		}
+		opt(&cfg)
+	}
+	merge := cfg.merge
 	if merge == nil {
-		panic("gobus: conflate.New requires a non-nil Merge")
+		merge = latest[V]
 	}
 	s := &shared[K, V]{merge: merge, receivers: make(map[*Receiver[K, V]]struct{})}
 	return &Hub[K, V]{s: s, tx: &Sender[K, V]{s: s}}
@@ -263,12 +311,12 @@ func (h *Hub[K, V]) WithKeyFilter(keep func(K) bool) ReceiverOption[K, V] {
 }
 
 // WithMerge returns an option making a receiver coalesce with its own merge
-// instead of the hub's shared one. This lets a single consumer apply a
-// different policy — e.g. annihilating pending values others must retain —
-// without affecting the rest of the bus. Use it when consumers of the same
-// producer have genuinely different requirements about what may be dropped,
-// which a single hub-wide Merge cannot express. merge is called under the bus
-// lock, like the shared one. Panics if merge is nil.
+// instead of the hub's. This lets a single consumer apply a different policy —
+// e.g. annihilating pending values others must retain — without affecting the
+// rest of the bus. Use it when consumers of the same producer have genuinely
+// different requirements about what may be dropped, which a single hub-wide
+// merge cannot express. merge is called under the bus lock, like the hub's.
+// Panics if merge is nil.
 func (h *Hub[K, V]) WithMerge(merge Merge[V]) ReceiverOption[K, V] {
 	if merge == nil {
 		panic("gobus: conflate.Hub.WithMerge requires a non-nil Merge")

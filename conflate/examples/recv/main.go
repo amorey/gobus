@@ -48,7 +48,7 @@ func merge(prev, next Update) (Update, bool) {
 }
 
 func main() {
-	hub := conflate.New[string](merge)
+	hub := conflate.New[string](conflate.WithDefaultMerge(merge))
 	// hub.Close() is idempotent close-all and hard tear-down (skips the drain
 	// that tx.Close gives subscribers). Deferring is still safe as a backstop
 	// because by the time it fires the soft shutdown below has completed.

@@ -86,7 +86,7 @@ func parkedRecv[K comparable, V any](t *testing.T, rx *Receiver[K, V], ctx conte
 }
 
 func TestImplementsCommonInterfaces(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	var _ gobus.Sender[int, int] = h.Sender()
 	var _ gobus.Receiver[int, int] = h.Receiver()
 }
@@ -94,7 +94,7 @@ func TestImplementsCommonInterfaces(t *testing.T) {
 // TestEventIsTheSingleCurrency pins the property that makes Event worth having:
 // every receive path hands back the same type, so one handler serves them all.
 func TestEventIsTheSingleCurrency(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	defer rx.Close()
 	tx := h.Sender()
@@ -121,7 +121,7 @@ func TestEventIsTheSingleCurrency(t *testing.T) {
 }
 
 func TestChanCarriesTheSameEventType(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	defer rx.Close()
 	require.NoError(t, h.Sender().Send(1, 10))
@@ -130,17 +130,84 @@ func TestChanCarriesTheSameEventType(t *testing.T) {
 	assert.Equal(t, gobus.Event[int, int]{Key: 1, Value: 10}, handle(<-rx.Chan()))
 }
 
-func TestNewRequiresMerge(t *testing.T) {
+func TestNewRejectsNilOption(t *testing.T) {
 	assert.Panics(t, func() { New[int, int](nil) })
 }
 
+func TestWithDefaultMergeRejectsNilMerge(t *testing.T) {
+	assert.Panics(t, func() { WithDefaultMerge[int](nil) })
+}
+
+// TestDefaultMergeIsLatestWins pins what omitting WithDefaultMerge means: a
+// Send for a key already pending replaces the undelivered value and the slot
+// survives. The last value is negative because latestWins annihilates on one —
+// a hub that picked that merge up fails here rather than passing by accident.
+func TestDefaultMergeIsLatestWins(t *testing.T) {
+	h := New[int, int]()
+	rx := h.Receiver()
+	defer rx.Close()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.Send(1, 20))
+	require.NoError(t, tx.Send(1, -1))
+	assertRecv(t, rx, 1, -1)
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+}
+
+// TestWithDefaultMergeOverridesTheDefault pins the option as the hub-wide
+// policy, annihilation included.
+func TestWithDefaultMergeOverridesTheDefault(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	rx := h.Receiver()
+	defer rx.Close()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.Send(1, -1)) // latestWins annihilates on a negative
+	_, err := rx.TryRecv()
+	assert.ErrorIs(t, err, gobus.ErrEmpty)
+}
+
+// TestLastDefaultMergeWins pins the option-application order New promises.
+func TestLastDefaultMergeWins(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins), WithDefaultMerge(func(prev, next int) (int, bool) {
+		return prev + next, true
+	}))
+	rx := h.Receiver()
+	defer rx.Close()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.Send(1, -1)) // the earlier merge would annihilate
+	assertRecv(t, rx, 1, 9)
+}
+
+// TestReceiverMergeOverridesTheDefaultedHubMerge pins the fallback on a hub
+// that named no merge: the receiver without its own resolves to latest, not to
+// nil.
+func TestReceiverMergeOverridesTheDefaultedHubMerge(t *testing.T) {
+	h := New[int, int]()
+	plain := h.Receiver()
+	defer plain.Close()
+	summing := h.Receiver(h.WithMerge(func(prev, next int) (int, bool) { return prev + next, true }))
+	defer summing.Close()
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.Send(1, 5))
+	assertRecv(t, plain, 1, 5)    // hub default: latest wins
+	assertRecv(t, summing, 1, 15) // its own merge
+}
+
 func TestSenderSingleton(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	assert.Same(t, h.Sender(), h.Sender())
 }
 
 func TestBasicDelivery(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 100))
 	assertRecv(t, rx, 1, 100)
@@ -148,7 +215,7 @@ func TestBasicDelivery(t *testing.T) {
 }
 
 func TestRecvWakesParkedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	got := make(chan gobus.Event[int, int], 1)
 	go func() {
@@ -166,7 +233,7 @@ func TestRecvWakesParkedReceiver(t *testing.T) {
 // already parked in the blocking select must wake with ErrClosed when Close
 // fires (distinct from a Close observed by the pre-lock check).
 func TestCloseWakesParkedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	errCh := parkedRecv(t, rx, context.Background())
 	rx.Close()
@@ -174,7 +241,7 @@ func TestCloseWakesParkedReceiver(t *testing.T) {
 }
 
 func TestRecvContextCancel(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := parkedRecv(t, rx, ctx)
@@ -188,7 +255,7 @@ func TestRecvContextCancel(t *testing.T) {
 // this, a consumer looping on RecvContext against a publisher fast enough to
 // keep something always queued would never observe its own shutdown signal.
 func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -209,7 +276,7 @@ func TestRecvContextCancelBeatsPendingValue(t *testing.T) {
 // ctx.Err() with the event still queued: waking consumes nothing, and the
 // loop-top ctx check sits above the pop.
 func TestRecvContextCancelBeatsValueDeliveredWhileParked(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := parkedRecv(t, rx, ctx)
@@ -246,7 +313,7 @@ func TestRecvContextCancelBeatsValueDeliveredWhileParked(t *testing.T) {
 func TestParkedCloseAndCancelResolveToClosed(t *testing.T) {
 	const iters = 200
 	for i := 0; i < iters; i++ {
-		h := New[int](latestWins)
+		h := New[int](WithDefaultMerge(latestWins))
 		rx := h.Receiver()
 		ctx, cancel := context.WithCancel(context.Background())
 		errCh := parkedRecv(t, rx, ctx)
@@ -295,7 +362,7 @@ func TestParkedCancelWakeStillLosesToClose(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			ctx, cancel := context.WithCancel(context.Background())
 			errCh := parkedRecv(t, rx, ctx)
@@ -323,7 +390,7 @@ func TestParkedCancelWakeStillLosesToClose(t *testing.T) {
 // cancelled exit: a parked reader that leaves via ctx must not leave the count
 // raised, or later Sends would signal a receiver nobody is waiting on.
 func TestRecvContextCancelDoesNotCloseReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ctx, cancel := context.WithCancel(context.Background())
 	errCh := parkedRecv(t, rx, ctx)
@@ -349,7 +416,7 @@ func TestRecvContextCancelDoesNotCloseReceiver(t *testing.T) {
 // context still has to be able to drain to ErrClosed instead of spinning on
 // ctx.Err() forever.
 func TestRecvContextDrainedSenderCloseBeatsCancel(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	h.Sender().Close()
 
@@ -364,7 +431,7 @@ func TestRecvContextDrainedSenderCloseBeatsCancel(t *testing.T) {
 // closed sender, but with an event still queued the receive is not terminal
 // yet, so the cancelled ctx wins and the event survives for a later drain.
 func TestRecvContextCancelBeatsUndrainedSenderClose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 1))
@@ -392,7 +459,7 @@ func TestRecvContextCancelBeatsUndrainedSenderClose(t *testing.T) {
 }
 
 func TestCoalesceLatestWins(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 100))
@@ -404,7 +471,7 @@ func TestCoalesceLatestWins(t *testing.T) {
 }
 
 func TestAnnihilation(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 100)) // enqueue key 1
@@ -417,7 +484,7 @@ func TestAnnihilation(t *testing.T) {
 }
 
 func TestWithKeyFilterFiltersAtEnqueue(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
 	tx := h.Sender()
 	// Unwanted keys are dropped at Send, so they never occupy a buffer slot.
@@ -433,12 +500,12 @@ func TestWithKeyFilterFiltersAtEnqueue(t *testing.T) {
 }
 
 func TestWithKeyFilterRequiresKeep(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	assert.Panics(t, func() { h.WithKeyFilter(nil) })
 }
 
 func TestWithMergeIsPerReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	shared := h.Receiver()
 	// This receiver annihilates any coalesced pair (keep=false) instead of
 	// taking the latest; the shared receiver is unaffected by the override.
@@ -454,14 +521,14 @@ func TestWithMergeIsPerReceiver(t *testing.T) {
 }
 
 func TestWithMergeRequiresMerge(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	assert.Panics(t, func() { h.WithMerge(nil) })
 }
 
 // TestOptionsCompose covers the combination a constructor-per-variant API
 // could not express at all: filter *and* a private merge on one receiver.
 func TestOptionsCompose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	// Keep only even keys, and annihilate on any coalesce rather than taking
 	// the latest.
 	rx := h.Receiver(
@@ -484,7 +551,7 @@ func TestOptionsCompose(t *testing.T) {
 }
 
 func TestReceiverRejectsNilOption(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	// A nil option is a caller bug; fail loudly rather than nil-dereferencing
 	// inside the hub, matching the nil-policy panics elsewhere in the package.
 	assert.Panics(t, func() { h.Receiver(nil) })
@@ -492,7 +559,7 @@ func TestReceiverRejectsNilOption(t *testing.T) {
 
 // TestOptionsLastWins pins the documented precedence for repeated options.
 func TestOptionsLastWins(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver(
 		h.WithKeyFilter(func(k int) bool { return k == 1 }),
 		h.WithKeyFilter(func(k int) bool { return k == 2 }),
@@ -505,7 +572,7 @@ func TestOptionsLastWins(t *testing.T) {
 }
 
 func TestStableOrder(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 10))
@@ -517,7 +584,7 @@ func TestStableOrder(t *testing.T) {
 }
 
 func TestRetouchKeepsPosition(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 10))
@@ -529,7 +596,7 @@ func TestRetouchKeepsPosition(t *testing.T) {
 }
 
 func TestFanoutIsolation(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rxA := h.Receiver()
 	rxB := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 7))
@@ -541,7 +608,7 @@ func TestFanoutIsolation(t *testing.T) {
 }
 
 func TestLateReceiverSeesNoHistory(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 10))
 	// A receiver created after the send starts empty — conflate keeps the
@@ -553,7 +620,7 @@ func TestLateReceiverSeesNoHistory(t *testing.T) {
 }
 
 func TestBoundedUnderSlowConsumer(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	// 1000 writes across 4 keys, never read: pending stays bounded by the key
@@ -568,7 +635,7 @@ func TestBoundedUnderSlowConsumer(t *testing.T) {
 }
 
 func TestTrySendAndSendContext(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.TrySend(1, 10))
@@ -619,7 +686,7 @@ func (c *lockProbeContext) busLocked() bool {
 }
 
 func TestContextIsNeverConsultedUnderTheBusLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	tx := h.Sender()
 	rx := h.Receiver()
 	inner, cancel := context.WithCancel(context.Background())
@@ -657,12 +724,12 @@ func TestPanickingCallbackReleasesTheBusLock(t *testing.T) {
 	for name, send := range sends {
 		t.Run(name, func(t *testing.T) {
 			explode := true
-			h := New[int](func(prev, next int) (int, bool) {
+			h := New[int](WithDefaultMerge(func(prev, next int) (int, bool) {
 				if explode {
 					panic(boom)
 				}
 				return next, true
-			})
+			}))
 			tx := h.Sender()
 			rx := h.Receiver()
 			require.NoError(t, send(tx, 1, 10)) // first touch: no Merge, no panic
@@ -696,7 +763,7 @@ func TestPanickingCallbackReleasesTheBusLock(t *testing.T) {
 // catch. Precedence is unaffected — a closed sender still outranks the
 // cancellation, which the second half asserts.
 func TestSendContextChecksCancellationAtTheLockNotAtEntry(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 
@@ -730,7 +797,7 @@ func TestSendContextChecksCancellationAtTheLockNotAtEntry(t *testing.T) {
 }
 
 func TestTryRecvOnClosedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	rx.Close()
 	_, err := rx.TryRecv()
@@ -744,7 +811,7 @@ func TestTryRecvFlushTerminatesOnAnyError(t *testing.T) {
 			name = "sender closed"
 		}
 		t.Run(name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			tx := h.Sender()
 			require.NoError(t, tx.Send(1, 11))
@@ -783,7 +850,7 @@ func TestTryRecvFlushTerminatesOnAnyError(t *testing.T) {
 }
 
 func TestTryRecvCloseRaceBeforeLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 1))
 	// Close wins the race between the lock-free done pre-check and taking mu;
@@ -794,7 +861,7 @@ func TestTryRecvCloseRaceBeforeLock(t *testing.T) {
 }
 
 func TestPeekDoesNotConsume(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 11))
 
@@ -815,7 +882,7 @@ func TestPeekDoesNotConsume(t *testing.T) {
 }
 
 func TestPeekReportsTheHeadNotTheNewest(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -832,7 +899,7 @@ func TestPeekReportsTheHeadNotTheNewest(t *testing.T) {
 }
 
 func TestPeekOnEmptyReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ev, err := rx.Peek()
 	assert.ErrorIs(t, err, gobus.ErrEmpty)
@@ -856,7 +923,7 @@ var hardCloses = []struct {
 func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
 	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			require.NoError(t, h.Sender().Send(1, 11))
 			tt.close(h, rx)
@@ -868,7 +935,7 @@ func TestPeekPrecedenceMatchesTryRecv(t *testing.T) {
 }
 
 func TestPeekDrainsThenReportsClosed(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -894,7 +961,7 @@ func TestPeekDrainsThenReportsClosed(t *testing.T) {
 // identity alone. A consumer folding an ordering quantity into V via Merge
 // reads it off this head, so the key must not jump on a re-send.
 func TestPeekReflectsCoalescingWithoutMovingTheHead(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -913,7 +980,7 @@ func TestPeekReflectsCoalescingWithoutMovingTheHead(t *testing.T) {
 // replacement head was first touched later — its ordering quantity is higher,
 // so the cursor can only move conservatively.
 func TestPeekSeesAnnihilation(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -928,7 +995,7 @@ func TestPeekSeesAnnihilation(t *testing.T) {
 }
 
 func TestPeekRespectsKeyFilter(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never the head
@@ -948,7 +1015,7 @@ func TestPeekRespectsKeyFilter(t *testing.T) {
 func TestPeekOnHardCloseWithQueuedKey(t *testing.T) {
 	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			require.NoError(t, h.Sender().Send(1, 11))
 			tt.close(h, rx)
@@ -962,7 +1029,7 @@ func TestPeekOnHardCloseWithQueuedKey(t *testing.T) {
 }
 
 func TestPeekCloseRaceBeforeLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 1))
 	// Close wins the race between the lock-free done pre-check and taking mu;
@@ -979,7 +1046,7 @@ func TestPeekCloseRaceBeforeLock(t *testing.T) {
 // has popped and not yet delivered when it runs — rather than through the
 // channel, which would race the delivery.
 func TestPeekReportsEmptyWhileFeederHoldsEvent(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	defer rx.Close()
 	require.NoError(t, h.Sender().Send(1, 11))
@@ -1007,7 +1074,7 @@ func TestPeekReportsEmptyWhileFeederHoldsEvent(t *testing.T) {
 var peekSink gobus.Event[int, int]
 
 func TestPeekAllocatesNothing(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	for k := 0; k < 64; k++ {
@@ -1025,7 +1092,7 @@ func TestPeekAllocatesNothing(t *testing.T) {
 // contract, and a duplicated key — the thing one entry per key rules out —
 // would pass any membership check.
 func TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -1041,7 +1108,7 @@ func TestTryRecvAllTakesTheWholeQueueInFirstTouchOrder(t *testing.T) {
 }
 
 func TestTryRecvAllOnEmptyReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 
 	evs, err := rx.TryRecvAll()
@@ -1054,7 +1121,7 @@ func TestTryRecvAllOnEmptyReceiver(t *testing.T) {
 // down the coalesce branch, which writes a slot without pushing the key back
 // onto the queue — so the key would vanish rather than reappear at the tail.
 func TestTryRecvAllEmptiesEveryStructure(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -1080,7 +1147,7 @@ func TestTryRecvAllEmptiesEveryStructure(t *testing.T) {
 func TestTryRecvAllPrecedenceMatchesTryRecv(t *testing.T) {
 	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			require.NoError(t, h.Sender().Send(1, 11))
 			tt.close(h, rx)
@@ -1100,7 +1167,7 @@ func TestTryRecvAllPrecedenceMatchesTryRecv(t *testing.T) {
 func TestTryRecvAllOnHardCloseAbandonsTheBacklog(t *testing.T) {
 	for _, tt := range hardCloses {
 		t.Run(tt.name, func(t *testing.T) {
-			h := New[int](latestWins)
+			h := New[int](WithDefaultMerge(latestWins))
 			rx := h.Receiver()
 			require.NoError(t, h.Sender().Send(1, 11))
 			require.NoError(t, h.Sender().Send(2, 22))
@@ -1118,7 +1185,7 @@ func TestTryRecvAllOnHardCloseAbandonsTheBacklog(t *testing.T) {
 // the soft close: the whole queue comes back with a nil error, and only the
 // *next* call is terminal. There is never "some values and ErrClosed".
 func TestTryRecvAllDrainsThenReportsClosed(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -1139,7 +1206,7 @@ func TestTryRecvAllDrainsThenReportsClosed(t *testing.T) {
 }
 
 func TestTryRecvAllOnClosedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	rx.Close()
 
@@ -1148,7 +1215,7 @@ func TestTryRecvAllOnClosedReceiver(t *testing.T) {
 }
 
 func TestTryRecvAllCloseRaceBeforeLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 11))
 	// Close wins the race between the lock-free done pre-check and taking mu;
@@ -1164,7 +1231,7 @@ func TestTryRecvAllCloseRaceBeforeLock(t *testing.T) {
 // rather than a raw history: an annihilated key is absent entirely, not present
 // carrying a tombstone value.
 func TestTryRecvAllSeesAnnihilation(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -1177,7 +1244,7 @@ func TestTryRecvAllSeesAnnihilation(t *testing.T) {
 }
 
 func TestTryRecvAllRespectsKeyFilter(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 7 }))
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11)) // filtered out: never buffered, so never in a cut
@@ -1195,7 +1262,7 @@ func TestTryRecvAllRespectsKeyFilter(t *testing.T) {
 // feeder's parked hook — it has popped and not yet delivered when it runs —
 // rather than through the channel, which would race the delivery.
 func TestTryRecvAllExcludesTheEventInFlightToTheFeeder(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	defer rx.Close()
 	tx := h.Sender()
@@ -1233,7 +1300,7 @@ var tryRecvAllSink []gobus.Event[int, int]
 // so hoisting the allocation above the empty check survives this test. What it
 // does catch is an allocation whose size does not follow the pending count.
 func TestTryRecvAllOnEmptyAllocatesNothing(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 
 	avg := testing.AllocsPerRun(100, func() { tryRecvAllSink, _ = rx.TryRecvAll() })
@@ -1242,7 +1309,7 @@ func TestTryRecvAllOnEmptyAllocatesNothing(t *testing.T) {
 }
 
 func TestReceiverClose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	rx.Close()
 	_, err := rx.Recv()
@@ -1251,7 +1318,7 @@ func TestReceiverClose(t *testing.T) {
 }
 
 func TestHubClose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 1))
 	h.Close()
@@ -1268,7 +1335,7 @@ func TestHubClose(t *testing.T) {
 }
 
 func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 	require.NoError(t, tx.Send(1, 11))
@@ -1308,7 +1375,7 @@ func TestSenderCloseDrainsThenErrClosed(t *testing.T) {
 // wins the ordering is still drained by the soft close.
 func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 	t.Run("close lands first", func(t *testing.T) {
-		h := New[int](latestWins)
+		h := New[int](WithDefaultMerge(latestWins))
 		rx := h.Receiver()
 		tx := h.Sender()
 
@@ -1323,7 +1390,7 @@ func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 	})
 
 	t.Run("send lands first", func(t *testing.T) {
-		h := New[int](latestWins)
+		h := New[int](WithDefaultMerge(latestWins))
 		rx := h.Receiver()
 		tx := h.Sender()
 
@@ -1338,7 +1405,7 @@ func TestSenderCloseIsSafeConcurrentWithSend(t *testing.T) {
 // promise covers both send paths, and SendContext reaches the lock by its own
 // route — the fast path it declines is the one that also consults ctx.
 func TestSenderCloseIsSafeConcurrentWithSendContext(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 
@@ -1355,7 +1422,7 @@ func TestSenderCloseIsSafeConcurrentWithSendContext(t *testing.T) {
 // close it races is either already poisoned or not yet. Both answers are the
 // contract; neither publishes anything, since there is nobody listening.
 func TestSenderCloseOnIdleHubRacesToNilOrClosed(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	tx := h.Sender()
 	require.Zero(t, h.forTestingReceiverCount(), "the fast path is what is under test")
 
@@ -1365,7 +1432,7 @@ func TestSenderCloseOnIdleHubRacesToNilOrClosed(t *testing.T) {
 }
 
 func TestSenderCloseWakesParkedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	errCh := parkedRecv(t, rx, context.Background())
 	h.Sender().Close()
@@ -1373,7 +1440,7 @@ func TestSenderCloseWakesParkedReceiver(t *testing.T) {
 }
 
 func TestCloseRaceBeforeLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	// Close wins the race between the lock-free done pre-check and taking mu;
 	// the under-lock re-check must still return ErrClosed, not a value.
@@ -1390,7 +1457,7 @@ func TestCloseRaceBeforeLock(t *testing.T) {
 // popped — the next loop iteration re-derives the answer from state and
 // ErrClosed wins deterministically rather than by select roulette.
 func TestCloseBeatsValueDeliveredWhileParked(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	errCh := parkedRecv(t, rx, context.Background())
 
@@ -1412,7 +1479,7 @@ func TestCloseBeatsValueDeliveredWhileParked(t *testing.T) {
 // silently drop the last update for a key.
 func TestRecvContextCancelRacingSendLosesNoEvent(t *testing.T) {
 	for i := 0; i < 500; i++ {
-		h := New[int](latestWins)
+		h := New[int](WithDefaultMerge(latestWins))
 		rx := h.Receiver()
 		tx := h.Sender()
 
@@ -1449,7 +1516,7 @@ func TestRecvContextCancelRacingSendLosesNoEvent(t *testing.T) {
 }
 
 func TestChanDeliversInOrderAndClosesOnSenderClose(t *testing.T) {
-	h := New[int](func(_, next string) (string, bool) { return next, true })
+	h := New[int, string]()
 	rx := h.Receiver()
 	defer rx.Close()
 
@@ -1487,7 +1554,7 @@ func TestChanDeliversInOrderAndClosesOnSenderClose(t *testing.T) {
 }
 
 func TestChanClosesOnReceiverClose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	ch := rx.Chan()
 	waitParked(t, rx) // feeder is parked on notify
@@ -1497,7 +1564,7 @@ func TestChanClosesOnReceiverClose(t *testing.T) {
 }
 
 func TestChanOnPreClosedReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	rx.Close()
 	// The feeder's first check sees the closed receiver and exits immediately.
@@ -1506,7 +1573,7 @@ func TestChanOnPreClosedReceiver(t *testing.T) {
 }
 
 func TestChanFeederCloseRaceBeforeLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 1))
 	// Close wins the race between the feeder's lock-free pre-check and the
@@ -1517,7 +1584,7 @@ func TestChanFeederCloseRaceBeforeLock(t *testing.T) {
 }
 
 func TestChanFeederCloseWhileDelivering(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	require.NoError(t, h.Sender().Send(1, 1))
 	// Close lands while the feeder is parked on the (unbuffered, unread) send;
@@ -1538,7 +1605,7 @@ func TestChanFeederCloseWhileDelivering(t *testing.T) {
 // across a small key space while one consumer drains, asserting nothing is
 // lost to a data race and nothing deadlocks.
 func TestConcurrentSendersAndReceiver(t *testing.T) {
-	h := New[int](func(_, next int) (int, bool) { return next, true })
+	h := New[int, int]()
 	rx := h.Receiver()
 	tx := h.Sender()
 	const senders, perSender, keys = 8, 200, 16
@@ -1568,7 +1635,7 @@ func TestConcurrentSendersAndReceiver(t *testing.T) {
 
 // TestConcurrentChanConsumer is a -race smoke test for the feeder path.
 func TestConcurrentChanConsumer(t *testing.T) {
-	h := New[int](func(_, next int) (int, bool) { return next, true })
+	h := New[int, int]()
 	rx := h.Receiver()
 	ch := rx.Chan()
 	tx := h.Sender()
@@ -1605,7 +1672,7 @@ func assertLiveCount[K comparable, V any](t *testing.T, h *Hub[K, V]) {
 // be made to fail deterministically in a Go test; this invariant is what that
 // property rests on, and it can.
 func TestLiveCountTracksTheReceiverSet(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	assertLiveCount(t, h) // a fresh hub: the zero value is already correct
 
 	rx1 := h.Receiver()
@@ -1639,7 +1706,7 @@ func TestLiveCountTracksTheReceiverSet(t *testing.T) {
 // s.receivers without going through deregisterLocked, so the poison is the only
 // thing standing between a hard tear-down and a fast path that answers nil.
 func TestHubCloseAlsoPoisonsTheCount(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	h.Receiver()
 	h.Close()
 	assert.True(t, h.forTestingLivePoisoned())
@@ -1665,7 +1732,7 @@ func countSendLocks[K comparable, V any](h *Hub[K, V]) *atomic.Int64 {
 // no-receiver assertions below would be vacuous: a lock counter that Send never
 // increments reads zero whether or not a fast path exists.
 func TestSendTakesTheBusLockWithAReceiver(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	rx := h.Receiver()
 	tx := h.Sender()
@@ -1683,7 +1750,7 @@ func TestSendTakesTheBusLockWithAReceiver(t *testing.T) {
 // hub-wide — every pop, Recv, Peek, TryRecv and Close takes it — so a publisher
 // on an unwatched hub otherwise contends with work it has no consumer for.
 func TestSendWithNoReceiversSkipsTheBusLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	tx := h.Sender()
 	locks := countSendLocks(h)
@@ -1698,7 +1765,7 @@ func TestSendWithNoReceiversSkipsTheBusLock(t *testing.T) {
 // receiver set in both directions, rather than being a one-way latch decided at
 // the first send.
 func TestFastPathFollowsTheReceiverSet(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	tx := h.Sender()
 	locks := countSendLocks(h)
@@ -1728,7 +1795,7 @@ func TestFastPathFollowsTheReceiverSet(t *testing.T) {
 // makes the poison guard in syncLiveLocked load-bearing: the deregistration
 // runs after the poison and must not write a zero over it.
 func TestClosedSenderReportsErrClosedWithNoReceivers(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	rx := h.Receiver()
 	tx := h.Sender()
 
@@ -1745,7 +1812,7 @@ func TestClosedSenderReportsErrClosedWithNoReceivers(t *testing.T) {
 // route: Hub.Close empties the receiver map itself, so the count reaches zero
 // without any receiver being closed by the caller.
 func TestHubCloseReportsErrClosedWithNoReceivers(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	h.Receiver()
 	tx := h.Sender()
 
@@ -1759,7 +1826,7 @@ func TestHubCloseReportsErrClosedWithNoReceivers(t *testing.T) {
 // receiver set: the receiver deregisters *itself* on the terminal ErrClosed of
 // a sender-close drain, rather than being closed by the caller.
 func TestDrainToErrClosedKeepsTheSenderClosed(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	rx := h.Receiver()
 	tx := h.Sender()
@@ -1778,7 +1845,7 @@ func TestDrainToErrClosedKeepsTheSenderClosed(t *testing.T) {
 // the fast path. Its own cancellation check is what keeps it from being a plain
 // delegation to Send.
 func TestSendContextWithNoReceiversSkipsTheBusLock(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	tx := h.Sender()
 	locks := countSendLocks(h)
@@ -1796,7 +1863,7 @@ func TestSendContextWithNoReceiversSkipsTheBusLock(t *testing.T) {
 // either way, and a receiver created afterwards observes no history, so there is
 // no "the value was not published" to assert that would fail against a mutant.
 func TestSendContextCancelledWithNoReceiversReportsCancellation(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	defer h.Close()
 	tx := h.Sender()
 	ctx, cancel := context.WithCancel(context.Background())
@@ -1822,7 +1889,7 @@ func TestSendContextCancelledWithNoReceiversReportsCancellation(t *testing.T) {
 func TestRegistrationBeforeSendIsAlwaysObserved(t *testing.T) {
 	const rounds = 200
 	for i := 0; i < rounds; i++ {
-		h := New[int](latestWins)
+		h := New[int](WithDefaultMerge(latestWins))
 		tx := h.Sender()
 		release := make(chan struct{})
 		done := make(chan error, 1)
@@ -1855,7 +1922,7 @@ func TestRegistrationBeforeSendIsAlwaysObserved(t *testing.T) {
 // concurrent Sender.Close would. A fast path that answers the cancellation
 // itself never reaches the seam, and returns context.Canceled here.
 func TestSendContextCancelledOnEmptyHubStillLosesToClose(t *testing.T) {
-	h := New[int](latestWins)
+	h := New[int](WithDefaultMerge(latestWins))
 	tx := h.Sender()
 	require.Zero(t, h.forTestingReceiverCount(), "the fast path is what is under test")
 

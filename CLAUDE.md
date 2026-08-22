@@ -86,8 +86,9 @@ A `UserPromptSubmit` hook (`scripts/writing-standards-hook.sh`, wired in `.claud
   another.
 - `errors.go` — shared sentinel errors: `ErrClosed`, `ErrEmpty`, `ErrFull`.
   `conflate` never returns `ErrFull`; it is reserved for future bounded buses.
-- `conflate/` — keyed latest-value fan-out. `New` returns `*Hub[K, V]`; handles
-  come from `hub.Sender()` and `hub.Receiver(opts...)`.
+- `conflate/` — keyed latest-value fan-out. `New(opts...)` returns `*Hub[K, V]`,
+  coalescing latest-wins unless `WithDefaultMerge` says otherwise; handles come
+  from `hub.Sender()` and `hub.Receiver(opts...)`.
 - `watch/` — keyed latest-value **state** bus. One receiver watches one key,
   seeded by the caller at `hub.Watch(k, initial)`; `Receiver.Close` is the
   unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
@@ -215,8 +216,10 @@ poison, so a closed hub always reaches the locked read. Copying the atomic here
 would buy nothing and give one field two access disciplines.
 
 **Nil means default on a receiver's policy fields.** `keep == nil` accepts all
-keys; `merge == nil` falls back to the hub's shared merge (always non-nil, since
-`New` panics otherwise).
+keys; `merge == nil` falls back to the hub's shared merge. That fallback is
+always non-nil: `New` resolves an absent `WithDefaultMerge` to `latest` at
+construction, so `enqueueLocked` needs no second nil check. Resolve any future
+hub option the same way, in `New`.
 
 **Close has three distinct meanings**, and tests depend on all three:
 `Sender.Close()` is a soft drain (receivers see pending values, then
@@ -228,19 +231,21 @@ itself so a long-lived hub doesn't pin drained receivers.
 
 Mirror `gochan`'s conventions unless there's a reason not to.
 
-- Policy is explicit, never implicit. A nil *function* passed to an option
-  constructor panics rather than being replaced by a default, and a nil
-  *option* passed to a constructor panics too (`conflate.Hub.Receiver`,
-  `watch.New`). `conflate.New` goes further and requires its `Merge`, because
-  coalescing is the point of that bus; `watch` lets `Accept` be omitted,
-  because a state bus has a meaningful identity rule (last-writer-wins) and
-  omitting the option is then a statement rather than an oversight. Supplying
-  a nil one is still a panic.
+- An omitted option states its default; a nil one panics. A nil *function*
+  passed to an option constructor panics rather than being replaced by a
+  default, and so does a nil *option* passed to a constructor
+  (`conflate.Hub.Receiver`, `conflate.New`, `watch.New`). Each hub's policy
+  option may be omitted: `conflate.WithDefaultMerge` falls back to latest-wins,
+  `watch.WithAccept` to last-writer-wins. Both buses have a meaningful identity
+  rule, which is what makes the omission a statement. What it costs on
+  `conflate` — the default discards an undelivered value, and nothing forces a
+  caller to think about that — is in
+  `docs/adr/2026-08-22-conflate-default-merge.md`.
 - Per-receiver options are **methods on the Hub** (`hub.WithKeyFilter(...)`),
   not package-level functions. Hub-*construction* options cannot be, since
-  there is no hub yet — `watch.WithAccept` is package-level for that reason,
-  and it works without type-argument noise only because `watch.Option[V]`
-  carries `V` alone. Adding a `K`-dependent hub option would force both type
+  there is no hub yet — `watch.WithAccept` and `conflate.WithDefaultMerge` are
+  package-level for that reason, and they work without type-argument noise only
+  because each package's `Option[V]` carries `V` alone. Adding a `K`-dependent hub option would force both type
   arguments at every call site; don't, without meaning to. This is forced by
   generics: package-level
   `WithKeyFilter[K, V](func(K) bool)` cannot infer `V`, and
