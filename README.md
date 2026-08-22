@@ -57,7 +57,7 @@ go func() {
 for _, u := range updates { tx.Send(u.Key, u) }
 ```
 
-Highlights: a hub-wide `WithDefaultMerge`; per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to read the backlog head without consuming it; `TryRecvAll()` to take the whole backlog as one atomic cut; a lock-free `Send` fast path when nobody is subscribed.
+Highlights: a hub-wide `WithDefaultMerge`; per-receiver `WithKey`, `WithKeyFilter` and `WithMerge` options; `Peek()` to read the backlog head without consuming it; `TryRecvAll()` to take the whole backlog as one atomic cut; a lock-free `Send` fast path when nobody is subscribed.
 
 **[Full documentation →](./conflate/README.md)**
 
