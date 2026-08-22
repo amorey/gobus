@@ -90,7 +90,7 @@ func (s *scheduler) advance(job, state string) { s.publish(job, s.commit(job, st
 func (s *scheduler) watchJob(job string) (*watch.Receiver[string, Schedule], Schedule) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.hub.Watch(job, s.state[job]), s.state[job]
+	return s.hub.Watch(job, s.hub.WithBaseline(s.state[job])), s.state[job]
 }
 
 // subscriber reads one job until the sender closes. Each holds one receiver,

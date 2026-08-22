@@ -66,7 +66,7 @@ var architectures = []architecture{
 			// ErrEmpty as it does for conflate.
 			h := watch.New[int, int]()
 			t.Cleanup(h.Close)
-			return h.Sender(), h.Watch(key, 0)
+			return h.Sender(), h.Watch(key, h.WithBaseline(0))
 		},
 	},
 	{
@@ -86,7 +86,7 @@ var architectures = []architecture{
 			// The key is ignored: a wildcard receiver takes whatever the suite
 			// publishes, which is what makes the negative assertions here
 			// non-vacuous without threading a key in.
-			return h.Sender(), h.WatchAcross(0)
+			return h.Sender(), h.WatchAcross(h.WithBaseline(0))
 		},
 	},
 }

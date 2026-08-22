@@ -65,7 +65,7 @@ Highlights: a hub-wide `WithDefaultMerge`; per-receiver `WithKey`, `WithKeyFilte
 
 ### Watch
 
-Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver holds one slot, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` both registers a receiver for one key and takes its baseline — the value the caller has just read — and `Receiver.Close()` is the matching unwatch. `Hub.WatchAcross` registers one for every key, still with a single slot.
+Keyed **state**. Where `conflate` streams events, `watch` distributes the *current value* of a key: each receiver holds one slot, so a slow consumer skips to the current value rather than replaying what it missed. `Hub.Watch` registers a receiver for one key, optionally with `hub.WithBaseline(cur)` — the value the caller has just read — and `Receiver.Close()` is the matching unwatch. `Hub.WatchAcross` registers one for every key, still with a single slot.
 
 ```go
 hub := watch.New[ObjectID](watch.WithAccept(func(prev, next Stamped) bool {
@@ -77,7 +77,7 @@ defer hub.Close()
 // caller code, so it is safe under your own lock.
 q.mu.Lock()
 cur := q.current(id)
-rx := hub.Watch(id, cur)
+rx := hub.Watch(id, hub.WithBaseline(cur))
 q.mu.Unlock()
 defer rx.Close()
 
@@ -86,7 +86,7 @@ for ev := range rx.Chan() {
 }
 ```
 
-Three things distinguish it from `conflate`. **Registration is the snapshot**: `Watch` takes the value you have just read, never hands it back, and calls no caller code — so you can read your state and register in one critical section. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — or every key, via `Hub.WatchAcross`, which still holds one slot and so collapses a burst across many keys into a single wake-up. A consumer that needs each key's *own* latest value wants `conflate` instead.
+Three things distinguish it from `conflate`. **Registration is the snapshot**: `WithBaseline` takes the value you have just read, never hands it back, and `Watch` calls no caller code — so you can read your state and register in one critical section. Omit the baseline and the first value is taken unjudged. **`Accept` decides which value wins**, evaluated per receiver against that receiver's own slot, so two concurrent sends settle on the same value whichever takes the lock first; omit it for last-writer-wins. **One key per receiver**, structurally — or every key, via `Hub.WatchAcross`, which still holds one slot and so collapses a burst across many keys into a single wake-up. A consumer that needs each key's *own* latest value wants `conflate` instead.
 
 **[Full documentation →](./watch/README.md)**
 

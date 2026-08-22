@@ -9,8 +9,9 @@
 //
 // # Registration is the snapshot
 //
-// [Hub.Watch] takes the value the caller has just read, and that value is the
-// baseline every later value is measured against. This is the opposite of
+// [Hub.WithBaseline] takes the value the caller has just read, and that value
+// is the baseline every later value is measured against. It is per receiver,
+// since each consumer reads at its own instant. This is the opposite of
 // github.com/amorey/gochan/watch, whose hub holds one seed and whose
 // registration deliberately does *not* snapshot. A reader arriving from the
 // sister package must not carry that rule across.
@@ -20,6 +21,12 @@
 // [Receiver.Peek] shows that unread value without taking it, under the same
 // closed > value precedence the taking paths use — so it too reports nothing
 // for a receiver still on its baseline.
+//
+// A receiver registered without a baseline has read nothing and holds nothing,
+// so its first value is taken whatever it is: there is no prev to give
+// [Accept], and the zero V would be a value the caller never held. Accept runs
+// on every value after that. Omit the baseline when any current value will do,
+// supply one when the consumer already knows the state it is improving on.
 //
 // # One key for each receiver, or all of them
 //
@@ -53,7 +60,9 @@ import (
 // caller's rule for which of two values wins.
 //
 // Accept runs under the bus lock, once for each receiver watching the key,
-// with that receiver's own current value as prev. It must not call back into
+// with that receiver's own current value as prev. A receiver holding nothing —
+// no [Hub.WithBaseline] and no value yet — takes its first value without
+// consulting Accept, since there is no prev to pass. It must not call back into
 // the hub, and it must not take any lock a caller may hold while calling
 // [Hub.Watch], [Sender.Send] or any Close — Watch is expressly safe to call
 // under a producer's lock, so an Accept that takes that same lock inverts the
@@ -90,6 +99,25 @@ func WithAccept[V any](fn Accept[V]) Option[V] {
 		panic("gobus: watch.WithAccept requires a non-nil Accept")
 	}
 	return func(c *config[V]) { c.accept = fn }
+}
+
+// WatchOption configures a receiver minted by [Hub.Watch] or
+// [Hub.WatchAcross]. Options are built by the hub's own [Hub.WithBaseline]
+// method, which fixes K and V from the hub — so option call sites need no type
+// arguments and a mismatched option fails to compile rather than at run time.
+//
+// The set of options is closed: the parameter type is unexported, so code
+// outside this package cannot name it to write one of its own.
+type WatchOption[K comparable, V any] func(*watchConfig[V])
+
+// watchConfig accumulates the options applied to one receiver. A zero
+// watchConfig is a receiver with no baseline, whose first value is taken
+// unjudged.
+//
+// hasBaseline carries the "set" bit because the zero V is a usable baseline.
+type watchConfig[V any] struct {
+	baseline    V
+	hasBaseline bool
 }
 
 // shared is the hub state common to the sender and every receiver. One mutex
@@ -200,30 +228,50 @@ func New[K comparable, V any](opts ...Option[V]) *Hub[K, V] {
 // same handle. After the hub is closed it reports [gobus.ErrClosed] on use.
 func (h *Hub[K, V]) Sender() *Sender[K, V] { return h.tx }
 
-// Watch makes a receiver for k, seeded with initial as the value the caller
-// has just read. The receiver watches k for its whole life; [Receiver.Close]
-// is the unwatch.
+// Watch makes a receiver for k. The receiver watches k for its whole life;
+// [Receiver.Close] is the unwatch.
 //
-// initial is the baseline, not a delivery: it is the prev of the first
-// [Accept] call, and it is never handed back through a receive. A receiver
-// reads a value only once a [Sender.Send] supersedes the baseline.
+// Without options the receiver has no baseline and its first value is taken
+// whatever it is — there is nothing yet for [Accept] to judge it against, and
+// nothing the consumer has read that it could fail to improve on. Accept runs
+// on every offer after that.
+//
+// [Hub.WithBaseline] supplies the value the caller has just read, making it the
+// prev of the first Accept. It is a baseline, not a delivery: it is never
+// handed back through a receive, so a receiver given one reads a value only
+// once a [Sender.Send] supersedes it.
 //
 // Watch calls no caller code, so it is safe to call while holding the
 // producer's own lock — which is how a subscriber reads its state and
 // registers in one critical section, with no value lost in between. See
 // [Accept] for the rule an Accept must obey to keep that safe.
 //
-// After [Hub.Close] the returned handle is pre-closed. After [Sender.Close] it
-// is live but holds nothing unread, so its first read is terminal.
-func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
-	return h.watch(k, false, initial)
+// Panics if any option is nil. After [Hub.Close] the returned handle is
+// pre-closed. After [Sender.Close] it is live but holds nothing unread, so its
+// first read is terminal.
+func (h *Hub[K, V]) Watch(k K, opts ...WatchOption[K, V]) *Receiver[K, V] {
+	return h.watch("Watch", k, false, opts)
+}
+
+// WithBaseline makes cur the receiver's starting value: the prev of its first
+// [Accept], and never a delivery. Use it when the caller has just read the
+// current state and wants the bus to measure against that read rather than
+// take the next value on trust. The zero V is a usable baseline.
+//
+// It is per receiver, not per hub, because each consumer's baseline is the
+// value it read at its own instant. [WithAccept], the rule those values are
+// judged by, is hub-wide for the opposite reason. See
+// docs/adr/2026-08-22-watch-optional-baseline.md.
+func (h *Hub[K, V]) WithBaseline(cur V) WatchOption[K, V] {
+	return func(c *watchConfig[V]) {
+		c.baseline, c.hasBaseline = cur, true
+	}
 }
 
 // WatchAcross makes a receiver watching every key — every key the hub carries
 // now and every key it ever will — holding one slot, like every other receiver
 // on this bus. That slot is the latest value published under *any* key, plus
-// the key it came from. initial is the value the caller has just read, exactly
-// as for [Hub.Watch].
+// the key it came from. It takes the same options as [Hub.Watch].
 //
 // A wildcard subscription in the MQTT or NATS sense is the closest model most
 // callers arrive with, and it differs in the two ways most likely to be assumed
@@ -253,21 +301,43 @@ func (h *Hub[K, V]) Watch(k K, initial V) *Receiver[K, V] {
 // nothing — which is unobservable, because every read reports [gobus.ErrEmpty]
 // until a value lands.
 //
-// Everything else matches [Hub.Watch]: initial is the caller's own baseline and
-// is never delivered back, no caller code runs during registration, and the
-// close behavior of all three Close methods is the same. It differs in holding
-// no key against the hub — a wildcard receiver keeps no per-key state alive, so
-// a key still costs nothing once its last [Hub.Watch] receiver has gone.
-func (h *Hub[K, V]) WatchAcross(initial V) *Receiver[K, V] {
+// Everything else matches [Hub.Watch]: without options the first value is taken
+// unjudged, a [Hub.WithBaseline] value is never delivered back, no caller code
+// runs during registration, and the close behavior of all three Close methods
+// is the same. A wildcard baseline is a prior value with no key attached, since
+// the caller read it before knowing which key would move next. It differs in
+// holding no key against the hub — a wildcard receiver keeps no per-key state
+// alive, so a key still costs nothing once its last [Hub.Watch] receiver has
+// gone.
+//
+// Panics if any option is nil.
+func (h *Hub[K, V]) WatchAcross(opts ...WatchOption[K, V]) *Receiver[K, V] {
 	var zero K
-	return h.watch(zero, true, initial)
+	return h.watch("WatchAcross", zero, true, opts)
 }
 
 // watch mints and registers a receiver. It is the one place a handle is built,
 // so the two constructors cannot drift on seeding, on the pre-closed case, or
 // on the ordering that makes registration a snapshot.
-func (h *Hub[K, V]) watch(k K, wildcard bool, initial V) *Receiver[K, V] {
-	rx := &Receiver[K, V]{s: h.s, key: k, wildcard: wildcard, val: initial, notify: make(chan struct{})}
+//
+// caller is the exported constructor's name, carried in only so a nil-option
+// panic names the method the caller actually wrote.
+func (h *Hub[K, V]) watch(caller string, k K, wildcard bool, opts []WatchOption[K, V]) *Receiver[K, V] {
+	var cfg watchConfig[V]
+	for _, opt := range opts {
+		if opt == nil {
+			panic("gobus: watch.Hub." + caller + " received a nil WatchOption")
+		}
+		opt(&cfg)
+	}
+	rx := &Receiver[K, V]{
+		s:        h.s,
+		key:      k,
+		wildcard: wildcard,
+		val:      cfg.baseline,
+		hasValue: cfg.hasBaseline,
+		notify:   make(chan struct{}),
+	}
 	rx.done.Init()
 	h.s.mu.Lock()
 	if h.s.hubClosed {
@@ -486,13 +556,20 @@ type Receiver[K comparable, V any] struct {
 
 	// val is the current value and version counts the values Accept has taken.
 	// lastSeen is the read position: val is unread exactly while version >
-	// lastSeen. Watch seeds them equal, so the caller's own initial is never
-	// delivered back to it.
+	// lastSeen. Registration seeds them equal, so a baseline the caller
+	// supplied is never delivered back to it.
+	//
+	// hasValue says whether val means anything yet. It is false on a receiver
+	// registered without [Hub.WithBaseline] and true from the first value that
+	// lands, which is what lets offerLocked skip Accept exactly once: there is
+	// no prev to pass it, and the zero V would be a value the caller never
+	// held.
 	//
 	// lastSeen lives here under s.mu rather than in the reading goroutine: a
 	// receiver with a Chan feeder is read by two goroutines, so single-consumer
 	// ownership is an intent, not an invariant.
 	val      V
+	hasValue bool
 	version  uint64
 	lastSeen uint64
 
@@ -536,11 +613,16 @@ type Receiver[K comparable, V any] struct {
 // back is always the one that landed together. For a single-key receiver k is
 // its own key by construction and the write is a no-op.
 func (rx *Receiver[K, V]) offerLocked(k K, v V) {
-	if rx.s.accept != nil && !rx.s.accept(rx.val, v) {
+	// An empty slot has no prev to give Accept, and a receiver that has read
+	// nothing has nothing this value could fail to improve on, so the first
+	// value lands unjudged. From then on the slot always holds a value and
+	// Accept runs on every offer.
+	if rx.hasValue && rx.s.accept != nil && !rx.s.accept(rx.val, v) {
 		return
 	}
 	rx.key = k
 	rx.val = v
+	rx.hasValue = true
 	rx.version++
 	rx.signalLocked()
 }
