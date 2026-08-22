@@ -5,6 +5,13 @@
 - **Scope:** `github.com/amorey/gobus`, package `watch`
 - **Breaking:** yes. `Hub.Watch` and `Hub.WatchAcross` change shape; every call
   site edits.
+- **Amends:** decision 2 of
+  [the watch ADR](./2026-08-01-watch-keyed-state-bus.md) — registration still
+  snapshots, but the baseline it snapshots is now optional — and the
+  constructor signature in
+  [the WatchAcross ADR](./2026-08-04-watch-watchacross.md). Both still read
+  `Watch(k, initial)`, which is what they decided on their dates; this one
+  supersedes that shape without rewriting them.
 
 ## Context
 

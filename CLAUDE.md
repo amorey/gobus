@@ -267,7 +267,10 @@ Mirror `gochan`'s conventions unless there's a reason not to.
 - An omitted option states its default; a nil one panics. A nil *function*
   passed to an option constructor panics rather than being replaced by a
   default, and so does a nil *option* passed to a constructor
-  (`conflate.Hub.Receiver`, `conflate.New`, `watch.New`). Each hub's policy
+  (`conflate.Hub.Receiver`, `conflate.New`, `watch.New`, `watch.Hub.Watch`,
+  `watch.Hub.WatchAcross`). Each of those names itself in the panic, so a
+  shared implementation behind two constructors has to carry the caller's name
+  in — `watch.Hub.watch` takes it as a parameter for exactly that. Each hub's policy
   option may be omitted: `conflate.WithDefaultMerge` falls back to latest-wins,
   `watch.WithAccept` to last-writer-wins. Both buses have a meaningful identity
   rule, which is what makes the omission a statement. What it costs on

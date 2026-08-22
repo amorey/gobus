@@ -250,7 +250,7 @@ func (h *Hub[K, V]) Sender() *Sender[K, V] { return h.tx }
 // pre-closed. After [Sender.Close] it is live but holds nothing unread, so its
 // first read is terminal.
 func (h *Hub[K, V]) Watch(k K, opts ...WatchOption[K, V]) *Receiver[K, V] {
-	return h.watch(k, false, opts)
+	return h.watch("Watch", k, false, opts)
 }
 
 // WithBaseline makes cur the receiver's starting value: the prev of its first
@@ -313,17 +313,20 @@ func (h *Hub[K, V]) WithBaseline(cur V) WatchOption[K, V] {
 // Panics if any option is nil.
 func (h *Hub[K, V]) WatchAcross(opts ...WatchOption[K, V]) *Receiver[K, V] {
 	var zero K
-	return h.watch(zero, true, opts)
+	return h.watch("WatchAcross", zero, true, opts)
 }
 
 // watch mints and registers a receiver. It is the one place a handle is built,
 // so the two constructors cannot drift on seeding, on the pre-closed case, or
 // on the ordering that makes registration a snapshot.
-func (h *Hub[K, V]) watch(k K, wildcard bool, opts []WatchOption[K, V]) *Receiver[K, V] {
+//
+// caller is the exported constructor's name, carried in only so a nil-option
+// panic names the method the caller actually wrote.
+func (h *Hub[K, V]) watch(caller string, k K, wildcard bool, opts []WatchOption[K, V]) *Receiver[K, V] {
 	var cfg watchConfig[V]
 	for _, opt := range opts {
 		if opt == nil {
-			panic("gobus: watch.Hub.Watch received a nil WatchOption")
+			panic("gobus: watch.Hub." + caller + " received a nil WatchOption")
 		}
 		opt(&cfg)
 	}

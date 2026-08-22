@@ -77,7 +77,7 @@ func TestWatchPanicsOnNilOption(t *testing.T) {
 
 func TestWatchAcrossPanicsOnNilOption(t *testing.T) {
 	h := New[string, val]()
-	assert.PanicsWithValue(t, "gobus: watch.Hub.Watch received a nil WatchOption", func() {
+	assert.PanicsWithValue(t, "gobus: watch.Hub.WatchAcross received a nil WatchOption", func() {
 		h.WatchAcross(nil)
 	})
 }

@@ -161,7 +161,7 @@ key**, including keys nobody has published under yet and keys the consumer
 cannot name.
 
 ```go
-rx := hub.WatchAcross(myBaseline)   // no key argument: there is no key to name
+rx := hub.WatchAcross()             // no key argument: there is no key to name
 defer rx.Close()
 
 for {
