@@ -13,7 +13,7 @@ This library is a collection of common event bus architectures for Go. It's desi
 
 | Package                             | Senders | Receivers | Semantics                                                                        |
 | ----------------------------------- | ------- | --------- | -------------------------------------------------------------------------------- |
-| [`conflate`](./conflate/README.md)  | 1       | many      | Keyed latest-value fan-out: per-key coalescing via a caller-supplied merge.       |
+| [`conflate`](./conflate/README.md)  | 1       | many      | Keyed latest-value fan-out: per-key coalescing, latest-wins or a caller's merge.  |
 | [`watch`](./watch/README.md)        | 1       | many      | Keyed state bus: one receiver watches one key (or all keys) and holds one slot.   |
 
 ## Installation
@@ -34,10 +34,10 @@ Requires Go 1.21+.
 
 ### Conflate
 
-Keyed latest-value **fan-out**. Every value reaches every receiver, but each receiver holds one slot per key: a `Send` for a key that is still undelivered coalesces into that slot via a caller-supplied `Merge` rather than queueing behind it. A slow receiver catches up to the current state of *every* key, in first-touch order, on memory bounded by the live key set instead of by write volume.
+Keyed latest-value **fan-out**. Every value reaches every receiver, but each receiver holds one slot per key: a `Send` for a key that is still undelivered coalesces into that slot rather than queueing behind it. By default the newer value wins. `WithDefaultMerge` sets a `Merge` that combines values instead, or annihilates the slot. A slow receiver catches up to the current state of *every* key, in first-touch order, on memory bounded by the live key set instead of by write volume.
 
 ```go
-hub := conflate.New[string, Update](merge)
+hub := conflate.New[string, Update]()
 defer hub.Close()
 
 tx := hub.Sender()
@@ -57,7 +57,7 @@ go func() {
 for _, u := range updates { tx.Send(u.Key, u) }
 ```
 
-Highlights: per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to read the backlog head without consuming it; `TryRecvAll()` to take the whole backlog as one atomic cut; a lock-free `Send` fast path when nobody is subscribed.
+Highlights: a hub-wide `WithDefaultMerge`; per-receiver `WithKeyFilter` and `WithMerge` options; `Peek()` to read the backlog head without consuming it; `TryRecvAll()` to take the whole backlog as one atomic cut; a lock-free `Send` fast path when nobody is subscribed.
 
 **[Full documentation →](./conflate/README.md)**
 

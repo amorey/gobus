@@ -30,4 +30,5 @@ go.work.sum
 *.code-workspace
 
 # Claude Code machine-local settings
-.claude/settings.local.json
+.claude/*
+!.claude/settings.json

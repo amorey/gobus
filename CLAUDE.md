@@ -54,6 +54,39 @@ with `dyld: missing LC_UUID load command` because 1.21's internal linker omits
 that command; add `-ldflags=-linkmode=external` to run them. That is an
 environment issue, not a code issue, and does not affect CI (Linux).
 
+## Pull requests
+
+`.github/pull_request_template.md` is the required body format. `gh pr create`
+does **not** apply it — the template is a GitHub *web form* feature, and the CLI
+sends whatever `--body` says — so read the file and fill its sections in by
+hand. Every PR body carries `## Summary` (the why) and `## Key Changes` (the
+what), and the title carries the emoji the template's comment block lists: 🎣
+bug fix, 🐋 new feature, 📜 documentation, ✨ general improvement, ahead of the
+conventional-commit prefix (`🐋 feat(conflate)!: …`).
+
+```console
+gh pr create --title "<emoji> <type>(<scope>): <subject>" --body-file <path>
+```
+
+`--body-file` over an inline heredoc: the body is long, and a file is what you
+can re-read and re-`PATCH` if the create half-fails. `gh pr edit` can fail on
+this repo with a Projects-classic GraphQL deprecation error and leave the PR
+untouched; `gh api -X PATCH repos/amorey/gobus/pulls/<n> --input <json>` is the
+way through.
+
+Push over HTTPS. `origin` is an SSH remote, which a sandbox cannot authenticate
+— `git push https://github.com/amorey/gobus.git <branch>`.
+
+## Writing standards
+
+1. **Code — simple, idiomatic, easy for a human to follow.** Prefer the boring construction. Match the idiom of the file you are in over the one you would pick on a blank page. Cleverness that needs a comment to survive review is usually the wrong trade.
+2. **Comments — terse, necessary, easy for a human to read.** Say what the code cannot: the *why*, the invariant, the trap that made this shape necessary. Never restate what the line already says. A comment justifying a choice the code no longer contains is dead weight — state the current design, don't argue against the alternatives you rejected (that is what `docs/adr/` is for).
+3. **Documentation — simple, concise, easy for a human to read.** Lead with what is true now. One idea per sentence.
+
+The failure mode to watch for is a comment addressed to a *reviewer* — someone who just watched the reasoning — rather than to a reader opening the file cold. The tell is a comment that spends its length on the option **not** taken.
+
+A `UserPromptSubmit` hook (`scripts/writing-standards-hook.sh`, wired in `.claude/settings.json`) restates this at the start of every turn, since the rule has to be in mind *before* anything is composed. Keep the script's short form in sync with this section.
+
 ## Layout
 
 - `conformance_test.go` (root, `package gobus_test`) — the cross-architecture
@@ -76,8 +109,9 @@ environment issue, not a code issue, and does not affect CI (Linux).
   another.
 - `errors.go` — shared sentinel errors: `ErrClosed`, `ErrEmpty`, `ErrFull`.
   `conflate` never returns `ErrFull`; it is reserved for future bounded buses.
-- `conflate/` — keyed latest-value fan-out. `New` returns `*Hub[K, V]`; handles
-  come from `hub.Sender()` and `hub.Receiver(opts...)`.
+- `conflate/` — keyed latest-value fan-out. `New(opts...)` returns `*Hub[K, V]`,
+  coalescing latest-wins unless `WithDefaultMerge` says otherwise; handles come
+  from `hub.Sender()` and `hub.Receiver(opts...)`.
 - `watch/` — keyed latest-value **state** bus. One receiver watches one key,
   seeded by the caller at `hub.Watch(k, initial)`; `Receiver.Close` is the
   unwatch. A caller `Accept(prev, next) bool` decides which of two values wins,
@@ -205,8 +239,10 @@ poison, so a closed hub always reaches the locked read. Copying the atomic here
 would buy nothing and give one field two access disciplines.
 
 **Nil means default on a receiver's policy fields.** `keep == nil` accepts all
-keys; `merge == nil` falls back to the hub's shared merge (always non-nil, since
-`New` panics otherwise).
+keys; `merge == nil` falls back to the hub's shared merge. That fallback is
+always non-nil: `New` resolves an absent `WithDefaultMerge` to `latest` at
+construction, so `enqueueLocked` needs no second nil check. Resolve any future
+hub option the same way, in `New`.
 
 **Close has three distinct meanings**, and tests depend on all three:
 `Sender.Close()` is a soft drain (receivers see pending values, then
@@ -218,19 +254,21 @@ itself so a long-lived hub doesn't pin drained receivers.
 
 Mirror `gochan`'s conventions unless there's a reason not to.
 
-- Policy is explicit, never implicit. A nil *function* passed to an option
-  constructor panics rather than being replaced by a default, and a nil
-  *option* passed to a constructor panics too (`conflate.Hub.Receiver`,
-  `watch.New`). `conflate.New` goes further and requires its `Merge`, because
-  coalescing is the point of that bus; `watch` lets `Accept` be omitted,
-  because a state bus has a meaningful identity rule (last-writer-wins) and
-  omitting the option is then a statement rather than an oversight. Supplying
-  a nil one is still a panic.
+- An omitted option states its default; a nil one panics. A nil *function*
+  passed to an option constructor panics rather than being replaced by a
+  default, and so does a nil *option* passed to a constructor
+  (`conflate.Hub.Receiver`, `conflate.New`, `watch.New`). Each hub's policy
+  option may be omitted: `conflate.WithDefaultMerge` falls back to latest-wins,
+  `watch.WithAccept` to last-writer-wins. Both buses have a meaningful identity
+  rule, which is what makes the omission a statement. What it costs on
+  `conflate` — the default discards an undelivered value, and nothing forces a
+  caller to think about that — is in
+  `docs/adr/2026-08-22-conflate-default-merge.md`.
 - Per-receiver options are **methods on the Hub** (`hub.WithKeyFilter(...)`),
   not package-level functions. Hub-*construction* options cannot be, since
-  there is no hub yet — `watch.WithAccept` is package-level for that reason,
-  and it works without type-argument noise only because `watch.Option[V]`
-  carries `V` alone. Adding a `K`-dependent hub option would force both type
+  there is no hub yet — `watch.WithAccept` and `conflate.WithDefaultMerge` are
+  package-level for that reason, and they work without type-argument noise only
+  because each package's `Option[V]` carries `V` alone. Adding a `K`-dependent hub option would force both type
   arguments at every call site; don't, without meaning to. This is forced by
   generics: package-level
   `WithKeyFilter[K, V](func(K) bool)` cannot infer `V`, and

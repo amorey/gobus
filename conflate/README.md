@@ -1,6 +1,6 @@
 # conflate
 
-*Keyed latest-value fan-out: one slot per key, coalesced by a caller-supplied merge.*
+*Keyed latest-value fan-out: one slot per key, coalesced latest-wins or by a caller-supplied merge.*
 
 [![Go Reference](https://pkg.go.dev/badge/github.com/amorey/gobus/conflate.svg)](https://pkg.go.dev/github.com/amorey/gobus/conflate)
 
@@ -33,8 +33,9 @@ Conflate is a single-producer, multi-consumer keyed latest-value bus. Every
 value published through the singleton `Sender` is fanned out to *every* live
 `Receiver`, but each receiver holds **one slot per key** plus an
 insertion-ordered key queue. A `Send` for a key that already has an undelivered
-value coalesces into that slot via a caller-supplied `Merge` instead of
-appending, and the key keeps its original queue position.
+value coalesces into that slot via the hub's `Merge` instead of appending, and
+the key keeps its original queue position. That merge is latest-wins unless
+`WithDefaultMerge` set another.
 
 Because conflate keeps the latest value **per key**, a slow receiver never
 lags-as-loss: it catches up to the current state of *every* key in first-touch
@@ -55,16 +56,8 @@ no residue, which is what `Merge`'s annihilation gives you.
 ## Quick start
 
 ```go
-// merge is the coalescing policy: how an undelivered pending value combines
-// with a newly sent one for the same key.
-merge := func(prev, next Update) (Update, bool) {
-    if prev.Phase == "Added" && next.Phase == "Deleted" {
-        return Update{}, false // annihilate: the consumer never saw it exist
-    }
-    return next, true // newer revision supersedes the older
-}
-
-hub := conflate.New[string, Update](merge)
+// No options: the newer value supersedes the undelivered one.
+hub := conflate.New[string, Update]()
 defer hub.Close()
 
 tx := hub.Sender()
@@ -123,10 +116,11 @@ nothing else is always safe.
 
 ## Receiver options
 
-Receivers take composable options, minted by the hub itself rather than by
-package-level functions — that fixes `K` and `V` from the hub, so call sites
-need no type arguments and an option built from a differently-typed hub is a
-compile error.
+Receivers take composable options, minted by the hub itself — that fixes `K`
+and `V` from the hub, so call sites need no type arguments and an option built
+from a differently-typed hub is a compile error. (`WithDefaultMerge`, which
+configures the hub, is package-level for the reason given
+[below](#hub).)
 
 ```go
 rx := hub.Receiver()                                  // every key, hub's merge
@@ -144,8 +138,8 @@ when consumers of the same producer disagree about what may be dropped; one
 hub-wide `Merge` cannot express that.
 
 Later options win over earlier ones for the same setting. A nil option, or a
-nil function passed to either constructor, panics — policy here is explicit,
-never implicitly defaulted.
+nil function passed to any option constructor, panics: omitting an option
+states its default, supplying a nil one is a mistake.
 
 ## Inspecting the backlog head
 
@@ -356,12 +350,24 @@ them under it, and each receiver pops from its own queue under the same lock.
 ### Hub
 
 ```go
-func New[K comparable, V any](merge Merge[V]) *Hub[K, V]
+func New[K comparable, V any](opts ...Option[V]) *Hub[K, V]
+func WithDefaultMerge[V any](merge Merge[V]) Option[V]
 ```
 
-Creates a hub whose receivers coalesce per key using `merge`. **Panics if
-`merge` is nil** — the coalescing policy is the whole point of this bus, so
-there is no implicit default.
+Creates a hub whose receivers coalesce per key. Without options the newer value
+supersedes the undelivered one, which is latest-value-per-key.
+`WithDefaultMerge` sets a different hub-wide policy: the merge every receiver
+uses unless `Hub.WithMerge` gave it one of its own. `New` **panics on a nil
+option**, `WithDefaultMerge` on a nil `Merge`.
+
+`WithDefaultMerge` is a package-level function, unlike the receiver options
+below, because it is built before the hub exists. It carries `V` alone, so a
+call site spells only `K`:
+
+```go
+hub := conflate.New[string, Update]()                              // latest wins
+hub := conflate.New[string](conflate.WithDefaultMerge(annihilating))
+```
 
 ```go
 func (h *Hub[K, V]) Sender() *Sender[K, V]
