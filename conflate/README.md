@@ -124,14 +124,25 @@ configures the hub, is package-level for the reason given
 
 ```go
 rx := hub.Receiver()                                  // every key, hub's merge
+rx := hub.Receiver(hub.WithKey(k))                    // one key, no predicate
 rx := hub.Receiver(hub.WithKeyFilter(wanted))         // one key subset
 rx := hub.Receiver(hub.WithMerge(stricter))           // own coalescing policy
 rx := hub.Receiver(hub.WithKeyFilter(wanted), hub.WithMerge(stricter))
 ```
 
-`WithKeyFilter` filters at *enqueue*, so an unwanted key never occupies a
-slot — that is how a consumer watching one key of a high-cardinality producer
-stays bounded by that one key.
+`WithKey` and `WithKeyFilter` both filter at *enqueue*, so an unwanted key never
+occupies a slot — that is how a consumer watching part of a high-cardinality
+producer stays bounded by the keys it wants.
+
+`WithKey` names one key and the send path compares it, running no caller code
+on that receiver's behalf. `WithKeyFilter` takes a predicate, which runs under
+the bus lock for every send. Reach for `WithKey` when one key is all you need;
+the zero `K` is a usable key.
+
+The two are the **same setting**, so the later of the two wins rather than
+composing — a receiver is filtered by a key or by a predicate, never by both.
+ANDing them would have no use anyway: a predicate over a single known key is a
+constant.
 
 `WithMerge` gives a single consumer its own coalescing policy, which matters
 when consumers of the same producer disagree about what may be dropped; one
@@ -372,6 +383,7 @@ hub := conflate.New[string](conflate.WithDefaultMerge(annihilating))
 ```go
 func (h *Hub[K, V]) Sender() *Sender[K, V]
 func (h *Hub[K, V]) Receiver(opts ...ReceiverOption[K, V]) *Receiver[K, V]
+func (h *Hub[K, V]) WithKey(k K) ReceiverOption[K, V]
 func (h *Hub[K, V]) WithKeyFilter(keep func(K) bool) ReceiverOption[K, V]
 func (h *Hub[K, V]) WithMerge(merge Merge[V]) ReceiverOption[K, V]
 func (h *Hub[K, V]) Close()
@@ -380,7 +392,8 @@ func (h *Hub[K, V]) Close()
 `Sender` returns the singleton send-side handle; repeated calls return the same
 one. `Receiver` returns a fresh handle per subscriber. Both return pre-closed
 handles once the hub is closed. `WithKeyFilter` and `WithMerge` panic on a nil
-function; `Receiver` panics on a nil option.
+function; `Receiver` panics on a nil option. `WithKey` takes a value, so it has
+nothing to reject.
 
 ### Merge
 

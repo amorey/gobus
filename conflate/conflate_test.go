@@ -504,6 +504,92 @@ func TestWithKeyFilterRequiresKeep(t *testing.T) {
 	assert.Panics(t, func() { h.WithKeyFilter(nil) })
 }
 
+func TestWithKeyFiltersAtEnqueue(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	rx := h.Receiver(h.WithKey(7))
+	tx := h.Sender()
+	// Other keys are dropped at Send, so they never occupy a buffer slot.
+	require.NoError(t, tx.Send(1, 100))
+	require.NoError(t, tx.Send(2, 200))
+	assert.Equal(t, 0, rx.lenForTest())
+	// The named key is buffered, coalesced and delivered as usual.
+	require.NoError(t, tx.Send(7, 42))
+	require.NoError(t, tx.Send(7, 43))
+	assert.Equal(t, 1, rx.lenForTest())
+	assertRecv(t, rx, 7, 43)
+	assertEmpty(t, rx)
+}
+
+// TestWithKeyTakesTheZeroKey pins the zero K as a usable key: hasKey carries
+// the "set" bit, so a receiver on key 0 must not behave like an unfiltered one.
+func TestWithKeyTakesTheZeroKey(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	rx := h.Receiver(h.WithKey(0))
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 100))
+	assert.Equal(t, 0, rx.lenForTest())
+	require.NoError(t, tx.Send(0, 42))
+	assertRecv(t, rx, 0, 42)
+	assertEmpty(t, rx)
+}
+
+// TestWithKeyRunsNoCallerCode pins what WithKey is for: the send path compares
+// the key instead of calling into the caller, so a receiver holding one has no
+// predicate to run. A key filter armed to explode proves the arm it replaced is
+// not still live.
+func TestWithKeyRunsNoCallerCode(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	rx := h.Receiver(
+		h.WithKeyFilter(func(int) bool { panic("key filter must not run") }),
+		h.WithKey(7),
+	)
+	tx := h.Sender()
+	require.NoError(t, tx.Send(1, 100))
+	require.NoError(t, tx.Send(7, 42))
+	assertRecv(t, rx, 7, 42)
+	assertEmpty(t, rx)
+}
+
+// TestKeySelectionLastWins pins WithKey and WithKeyFilter as one setting: each
+// clears the other, in both orders.
+func TestKeySelectionLastWins(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	tx := h.Sender()
+
+	filterLast := h.Receiver(h.WithKey(1), h.WithKeyFilter(func(k int) bool { return k == 2 }))
+	keyLast := h.Receiver(h.WithKeyFilter(func(k int) bool { return k == 1 }), h.WithKey(2))
+
+	require.NoError(t, tx.Send(1, 10))
+	require.NoError(t, tx.Send(2, 20))
+	// TryRecv, not Recv: both sends have landed, so the answer is already
+	// there, and a receiver that wrongly applies both settings at once takes
+	// neither key — which a blocking read would hang on instead of failing.
+	for _, rx := range []*Receiver[int, int]{filterLast, keyLast} {
+		ev, err := rx.TryRecv()
+		require.NoError(t, err)
+		assert.Equal(t, gobus.Event[int, int]{Key: 2, Value: 20}, ev)
+		assertEmpty(t, rx)
+	}
+}
+
+// TestWithKeyComposesWithMerge covers a key and a private merge on one
+// receiver, the combination a constructor-per-variant API could not express.
+func TestWithKeyComposesWithMerge(t *testing.T) {
+	h := New[int](WithDefaultMerge(latestWins))
+	rx := h.Receiver(
+		h.WithKey(2),
+		h.WithMerge(func(prev, next int) (int, bool) { return prev + next, true }),
+	)
+	tx := h.Sender()
+
+	require.NoError(t, tx.Send(1, 10)) // other key: filtered out entirely
+	require.NoError(t, tx.Send(2, 20))
+	require.NoError(t, tx.Send(2, 30)) // coalesce on rx -> summed
+	assert.Equal(t, 1, rx.lenForTest())
+	assertRecv(t, rx, 2, 50)
+	assertEmpty(t, rx)
+}
+
 func TestWithMergeIsPerReceiver(t *testing.T) {
 	h := New[int](WithDefaultMerge(latestWins))
 	shared := h.Receiver()

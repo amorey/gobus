@@ -244,6 +244,12 @@ always non-nil: `New` resolves an absent `WithDefaultMerge` to `latest` at
 construction, so `enqueueLocked` needs no second nil check. Resolve any future
 hub option the same way, in `New`.
 
+Key selection is the exception, because the zero `K` is a usable key and so
+cannot double as "unset". `hasKey` carries that bit, and `WithKey`/
+`WithKeyFilter` each clear the other's field — they are one setting, and
+`enqueueLocked` relies on at most one arm being live. A future option that
+narrows keys belongs in the same mutual exclusion, not alongside it.
+
 **Close has three distinct meanings**, and tests depend on all three:
 `Sender.Close()` is a soft drain (receivers see pending values, then
 `ErrClosed`), `Hub.Close()` is hard tear-down with no drain, `Receiver.Close()`

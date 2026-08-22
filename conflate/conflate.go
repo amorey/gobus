@@ -55,12 +55,13 @@
 // receiver and conflate has no replay.
 //
 // Per-receiver policy overrides, passed as options to [Hub.Receiver].
-// [Hub.WithKeyFilter] filters keys at enqueue time, so a receiver interested
-// in one key out of a high-cardinality producer stays bounded by the keys it
-// actually wants. [Hub.WithMerge] lets a single consumer coalesce by its own
-// policy without affecting the rest of the bus — necessary when consumers of
-// the same producer disagree about what may be dropped, since one hub-wide
-// merge cannot express that. The options compose. [WithDefaultMerge] sets the
+// [Hub.WithKey] and [Hub.WithKeyFilter] filter keys at enqueue time, so a
+// receiver interested in part of a high-cardinality producer stays bounded by
+// the keys it actually wants; WithKey names one key and runs no caller code,
+// WithKeyFilter takes a predicate. [Hub.WithMerge] lets a single consumer
+// coalesce by its own policy without affecting the rest of the bus — necessary
+// when consumers of the same producer disagree about what may be dropped, since
+// one hub-wide merge cannot express that. The options compose. [WithDefaultMerge] sets the
 // hub's fallback at construction; [Hub.WithMerge] overrides it for one
 // receiver.
 //
@@ -129,8 +130,8 @@ func WithDefaultMerge[V any](merge Merge[V]) Option[V] {
 }
 
 // ReceiverOption configures a receiver minted by [Hub.Receiver]. Options are
-// built by the hub's own [Hub.WithKeyFilter] and [Hub.WithMerge] methods,
-// which fix K and V from the hub — so option call sites need no type arguments
+// built by the hub's own [Hub.WithKey], [Hub.WithKeyFilter] and [Hub.WithMerge]
+// methods, which fix K and V from the hub — so option call sites need no type arguments
 // and a mismatched option fails to compile rather than at run time.
 //
 // The set of options is closed: the parameter type is unexported, so code
@@ -139,9 +140,16 @@ type ReceiverOption[K comparable, V any] func(*receiverConfig[K, V])
 
 // receiverConfig accumulates the options applied to one receiver. A zero
 // receiverConfig is the default receiver: every key, the hub's shared merge.
+//
+// key/hasKey and keep are the same setting expressed two ways, so each of
+// [Hub.WithKey] and [Hub.WithKeyFilter] clears the other's field: whichever
+// came last decides which keys the receiver takes. hasKey carries the "set"
+// bit because the zero K is a usable key.
 type receiverConfig[K comparable, V any] struct {
-	keep  func(K) bool
-	merge Merge[V]
+	key    K
+	hasKey bool
+	keep   func(K) bool
+	merge  Merge[V]
 }
 
 // shared is the hub state common to the sender and every receiver. A single
@@ -215,6 +223,8 @@ type Sender[K comparable, V any] struct{ s *shared[K, V] }
 // lock.
 type Receiver[K comparable, V any] struct {
 	s       *shared[K, V]
+	key     K                   // the only key taken, when hasKey; zero and unread otherwise
+	hasKey  bool                // true = [Hub.WithKey]; then keep is nil
 	keep    func(K) bool        // nil = accept all keys; else enqueue only matching keys
 	merge   Merge[V]            // nil = use the hub's shared merge; else this receiver's own
 	order   *list.List          // K in first-touch order; bounded by live keys
@@ -283,6 +293,7 @@ func (h *Hub[K, V]) Sender() *Sender[K, V] { return h.tx }
 // [Hub.WithMerge] — and compose freely:
 //
 //	rx := hub.Receiver()                           // every key, hub's merge
+//	rx := hub.Receiver(hub.WithKey(k))             // one key, no predicate
 //	rx := hub.Receiver(hub.WithKeyFilter(wanted))  // one key subset
 //	rx := hub.Receiver(hub.WithMerge(stricter))    // own coalescing policy
 //	rx := hub.Receiver(hub.WithKeyFilter(wanted), hub.WithMerge(stricter))
@@ -292,13 +303,30 @@ func (h *Hub[K, V]) Receiver(opts ...ReceiverOption[K, V]) *Receiver[K, V] {
 	return h.receiver(opts)
 }
 
+// WithKey returns an option restricting a receiver to the single key k. Other
+// keys are dropped at Send time and never buffered, so the receiver's memory is
+// bounded by that one key.
+//
+// It is [Hub.WithKeyFilter] for the case that needs no predicate: the send path
+// compares k rather than calling into caller code, so the fan-out runs no
+// arbitrary function under the bus lock on this receiver's behalf. The zero K
+// is a usable key.
+//
+// WithKey and WithKeyFilter are the same setting, so the later of the two
+// decides which keys the receiver takes.
+func (h *Hub[K, V]) WithKey(k K) ReceiverOption[K, V] {
+	return func(c *receiverConfig[K, V]) {
+		c.key, c.hasKey, c.keep = k, true, nil
+	}
+}
+
 // WithKeyFilter returns an option restricting a receiver to keys for which
 // keep returns true; all other keys are dropped at Send time and never
 // buffered. Filtering at enqueue keeps a selective receiver's memory bounded
-// by the keys it actually wants rather than the producer's whole key space —
-// important for a receiver interested in a single key out of a
-// high-cardinality producer. keep is called under the bus lock, so it must not
-// call back into the hub. Panics if keep is nil.
+// by the keys it actually wants rather than the producer's whole key space.
+// keep is called under the bus lock, so it must not call back into the hub.
+// Panics if keep is nil. For a single key, [Hub.WithKey] says the same thing
+// without the call.
 //
 // It is a method on Hub rather than a package-level function so that K and V
 // are fixed by the hub: callers write no type arguments, and an option built
@@ -307,7 +335,9 @@ func (h *Hub[K, V]) WithKeyFilter(keep func(K) bool) ReceiverOption[K, V] {
 	if keep == nil {
 		panic("gobus: conflate.Hub.WithKeyFilter requires a non-nil keep func")
 	}
-	return func(c *receiverConfig[K, V]) { c.keep = keep }
+	return func(c *receiverConfig[K, V]) {
+		c.keep, c.hasKey = keep, false
+	}
 }
 
 // WithMerge returns an option making a receiver coalesce with its own merge
@@ -334,6 +364,8 @@ func (h *Hub[K, V]) receiver(opts []ReceiverOption[K, V]) *Receiver[K, V] {
 	}
 	rx := &Receiver[K, V]{
 		s:       h.s,
+		key:     cfg.key,
+		hasKey:  cfg.hasKey,
 		keep:    cfg.keep,
 		merge:   cfg.merge,
 		order:   list.New(),
@@ -563,6 +595,12 @@ func (tx *Sender[K, V]) Close() {
 
 // enqueueLocked merges or appends v for key k. Caller holds s.mu.
 func (rx *Receiver[K, V]) enqueueLocked(k K, v V) {
+	// At most one of these arms is live: the two options that set them clear
+	// each other, so a receiver is filtered by a key or by a predicate, never
+	// by both.
+	if rx.hasKey && k != rx.key {
+		return // not this receiver's key; never buffer it
+	}
 	if rx.keep != nil && !rx.keep(k) {
 		return // not a key this receiver wants; never buffer it
 	}
