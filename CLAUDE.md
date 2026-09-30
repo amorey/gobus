@@ -54,28 +54,15 @@ with `dyld: missing LC_UUID load command` because 1.21's internal linker omits
 that command; add `-ldflags=-linkmode=external` to run them. That is an
 environment issue, not a code issue, and does not affect CI (Linux).
 
-## Pull requests
+## Commits
 
-`.github/pull_request_template.md` is the required body format. `gh pr create`
-does **not** apply it — the template is a GitHub *web form* feature, and the CLI
-sends whatever `--body` says — so read the file and fill its sections in by
-hand. Every PR body carries `## Summary` (the why) and `## Key Changes` (the
-what), and the title carries the emoji the template's comment block lists: 🎣
-bug fix, 🐋 new feature, 📜 documentation, ✨ general improvement, ahead of the
-conventional-commit prefix (`🐋 feat(conflate)!: …`).
+Keep commits minimal and focused. Multiple commits to accomplish a task are fine if they represent logical, well-separated steps that make the change easier to review.
 
-```console
-gh pr create --title "<emoji> <type>(<scope>): <subject>" --body-file <path>
-```
+Use [conventional commit](https://www.conventionalcommits.org/) format: `<type>(<scope>): <description>`. Types: `build`, `chore`, `ci`, `docs`, `feat`, `fix`, `perf`, `refactor`, `revert`, `style`, `test`. Description in imperative mood, lowercase, no period, under 72 chars. Add body only if the "why" isn't obvious; wrap body lines at 72 characters. Always sign-off on commits (`-s`). Only add a "Co-authored-by" trailer if a human was not in the loop or if the user requested it.
 
-`--body-file` over an inline heredoc: the body is long, and a file is what you
-can re-read and re-`PATCH` if the create half-fails. `gh pr edit` can fail on
-this repo with a Projects-classic GraphQL deprecation error and leave the PR
-untouched; `gh api -X PATCH repos/amorey/gobus/pulls/<n> --input <json>` is the
-way through.
+## Pull Requests
 
-Push over HTTPS. `origin` is an SSH remote, which a sandbox cannot authenticate
-— `git push https://github.com/amorey/gobus.git <branch>`.
+PR titles should be capitalized, imperative mood, no conventional commit prefixes (e.g. "Add login page" not "feat: add login page"). Prefix PR titles with the correct emoji based on the change type: 🎣 Bug fix, 🐋 New feature, 📜 Documentation, ✨ General improvement. Always use the repo's `.github/pull_request_template.md` — fill in each section from the commits/diff, replace HTML comment placeholders with actual content. For checklist items that can be resolved automatically (like emoji prefixes), mark them as complete. Use prose in summaries. Reference related issues (e.g. "Closes #123", "Ref #124"). Keep changes minimal and focused for quick review.
 
 ## Writing standards
 
