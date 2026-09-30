@@ -344,6 +344,11 @@ and Go chooses between ready arms at random. Two consequences:
 What holds is that values arrive **in order** and that a consumer which keeps
 reading **converges on the current value**.
 
+Once you read from the channel, don't also call `Recv`, `RecvContext` or
+`TryRecv` on that receiver. Each value goes to only one reader, so a value
+taken directly never reaches the channel, and a channel reader waiting for it
+blocks until the next send.
+
 The channel closes when the feeder observes receiver-close, or
 sender/hub-close with nothing left to drain. Abandoning the channel without
 calling `Receiver.Close()` pins the feeder goroutine. **Always `Close` the
@@ -356,10 +361,10 @@ through the hub lock, and `Send` first reads a lock-free receiver count so it
 takes that lock only when a receiver is registered. `Send` then touches only
 the receivers watching its key.
 
-A `Receiver` is intended for a single consumer goroutine, but `watch` treats
-that as intent rather than invariant: a receiver using `Chan()` genuinely has
-two readers (the feeder and any direct `TryRecv`), so its read position lives
-under the hub lock rather than in the reading goroutine. `Peek` and `TryRecv`
+A `Receiver` is intended for a single consumer goroutine. Its read position
+lives under the hub lock, so mixing `Chan()` with direct reads is memory-safe,
+but the feeder and the direct reader split values between them — see
+[Chan support](#chan-support). `Peek` and `TryRecv`
 are safe from any goroutine; they are only *meaningful* on the consuming one,
 since a concurrent reader can take the value between your two calls.
 

@@ -860,6 +860,11 @@ func (rx *Receiver[K, V]) recvLoop(ctx context.Context) (gobus.Event[K, V], erro
 // be delivered is replaced by the current one. Repeated calls return the same
 // channel.
 //
+// Once you read from the channel, don't also call Recv, RecvContext or TryRecv
+// on this receiver. Each value goes to only one reader, so a value taken
+// directly never reaches the channel, and a channel reader waiting for it
+// blocks until the next send.
+//
 // The channel closes when the feeder observes receiver-close, or
 // sender/hub-close with nothing left to drain.
 //

@@ -336,6 +336,10 @@ feeder is parked on delivery enqueues the key afresh rather than coalescing
 into the in-flight event. (This is also why `Peek` reports `ErrEmpty` for an
 event in flight.)
 
+Once you read from the channel, don't also call `Recv`, `RecvContext`,
+`TryRecv` or `TryRecvAll` on that receiver. Each event goes to only one reader,
+so an event taken directly never reaches the channel.
+
 The channel closes when the feeder observes receiver-close, or sender/hub-close
 with nothing left to drain. Abandoning the channel without calling
 `Receiver.Close()` pins the feeder goroutine — it parks forever waiting for the
