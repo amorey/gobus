@@ -1001,6 +1001,10 @@ func (rx *Receiver[K, V]) Peek() (gobus.Event[K, V], error) {
 // slots, so a Send for that key while the feeder is parked on delivery
 // enqueues the key afresh rather than coalescing into the in-flight event.
 //
+// Once you read from the channel, don't also call Recv, RecvContext, TryRecv
+// or TryRecvAll on this receiver. Each event goes to only one reader, so an
+// event taken directly never reaches the channel.
+//
 // The channel is closed when the feeder observes receiver-close, or
 // sender/hub-close with nothing left to drain. Abandoning the channel without
 // calling [Receiver.Close] pins the feeder goroutine — it will park forever
