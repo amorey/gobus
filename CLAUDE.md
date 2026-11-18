@@ -54,6 +54,30 @@ with `dyld: missing LC_UUID load command` because 1.21's internal linker omits
 that command; add `-ldflags=-linkmode=external` to run them. That is an
 environment issue, not a code issue, and does not affect CI (Linux).
 
+### Nightly stress run
+
+`.github/workflows/stress.yml` runs every test nightly at 05:00 UTC, on Go
+1.26 only, across Linux, macOS and Windows on amd64 and arm64. Each runner
+gets one job per `-cpu` value (default `1` and `4`), with and without `-race`,
+using `-shuffle=on -count=3`. Dispatch it by hand to change `count` or `cpu`.
+It does not run on a schedule in forks.
+
+A red run means a concurrency bug and nothing else: a test that fails only
+under another order, runner, CPU count or repetition. The `report` job opens
+one `needs-triage` issue per failing test (`Stress: <Test> fails in
+<package>`), or comments on the open one, plus a `Stress run failed outside a
+test` issue for build failures, cancels and lost runners.
+
+To reproduce, run the command from the issue at the repo root, on the runner's
+OS and arch where you can:
+
+```console
+go test -race -cpu 4 -shuffle=<seed> -count=3 ./watch
+```
+
+It runs the whole package, since the seed orders all of it.
+`scripts/stress.go` builds those commands from the `go test -json` output.
+
 ## Commits
 
 Keep commits minimal and focused. Multiple commits to accomplish a task are fine if they represent logical, well-separated steps that make the change easier to review.
