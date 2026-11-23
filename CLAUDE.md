@@ -68,6 +68,12 @@ one `needs-triage` issue per failing test (`Stress: <Test> fails in
 <package>`), or comments on the open one, plus a `Stress run failed outside a
 test` issue for build failures, cancels and lost runners.
 
+GitHub cancels a job no hosted runner picks up in about 15 minutes, which
+macOS arm64 hits under capacity constraints. When those are a run's only
+failures, `stress-retry.yml` reruns them, up to attempt 3, and the `report`
+job files nothing until that last attempt. Its threshold must match the one in
+`stress-retry.yml`.
+
 To reproduce, run the command from the issue at the repo root, on the runner's
 OS and arch where you can:
 

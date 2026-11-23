@@ -145,6 +145,27 @@ jobs:
           set -euo pipefail
           shopt -s nullglob
 
+          # Every stress job that did not pass, by the id in its name, with how
+          # it ended. A job with no steps never got a runner; a test step that
+          # never concluded means the runner was lost.
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name | startswith("Go · Stress"))
+                  | select(.conclusion != "success" and .conclusion != "skipped")
+                  | [(.name | capture("\\((?<id>[^)]+)\\)$").id | gsub(", "; "-")),
+                     (if (.steps | length) == 0 then "unstarted"
+                      elif .conclusion == "cancelled" then "cancelled"
+                      elif any(.steps[]; .name == "Run tests under stress" and .conclusion == null) then "lost"
+                      else "failed" end)]
+                  | @tsv' > failed-jobs.txt
+
+          # stress-retry.yml reruns a run whose only failures never started,
+          # up to attempt 3, so such a run is reported on that attempt alone.
+          # Keep the 3 in step with it.
+          if [ "$RUN_ATTEMPT" -lt 3 ] && [ -s failed-jobs.txt ] && ! grep -qv $'\tunstarted$' failed-jobs.txt; then
+            echo '::notice::only unstarted jobs failed; stress-retry reruns them'
+            exit 0
+          fi
+
           # Each artifact lands in stress/<name>/, even a lone one. The download
           # fails when no job left an artifact; a lost runner leaves none.
           if ! gh run download "$RUN_ID" --pattern 'stress-*' --dir stress; then
@@ -165,19 +186,6 @@ jobs:
               gh issue create --title "$title" --label needs-triage --body-file "$body"
             fi
           }
-
-          # Every stress job that did not pass, by the id in its name, with how
-          # it ended. A job with no steps never got a runner; a test step that
-          # never concluded means the runner was lost.
-          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
-            --jq '.jobs[] | select(.name | startswith("Go · Stress"))
-                  | select(.conclusion != "success" and .conclusion != "skipped")
-                  | [(.name | capture("\\((?<id>[^)]+)\\)$").id | gsub(", "; "-")),
-                     (if (.steps | length) == 0 then "unstarted"
-                      elif .conclusion == "cancelled" then "cancelled"
-                      elif any(.steps[]; .name == "Run tests under stress" and .conclusion == null) then "lost"
-                      else "failed" end)]
-                  | @tsv' > failed-jobs.txt
 
           reports=(stress/*/failures.json)
           if [ ${#reports[@]} -gt 0 ]; then

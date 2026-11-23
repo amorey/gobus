@@ -1,0 +1,45 @@
+name: stress-retry
+
+# Reruns a stress run whose only failures are jobs that never got a runner.
+# GitHub cancels a job its hosted pool has not acquired in about 15 minutes,
+# which macOS arm64 hits under capacity constraints even when the account's
+# macOS concurrency limit has room. A rerun queues those jobs again. The report
+# job in stress.yml files nothing for such a run before attempt 3; keep the 3
+# here in step with it.
+
+permissions: {}
+
+on:
+  workflow_run:
+    workflows:
+      - stress
+    types:
+      - completed
+
+jobs:
+  retry:
+    name: Retry unstarted jobs
+    # A cancel of the whole run concludes cancelled, not failure.
+    if: github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.run_attempt < 3
+    runs-on: ubuntu-24.04
+    permissions:
+      actions: write
+    steps:
+      - name: Rerun if only unstarted jobs failed
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          # How each stress job that did not pass ended; no steps means no runner.
+          gh api --paginate "repos/$GH_REPO/actions/runs/$RUN_ID/attempts/$RUN_ATTEMPT/jobs" \
+            --jq '.jobs[] | select(.name | startswith("Go · Stress"))
+                  | select(.conclusion != "success" and .conclusion != "skipped")
+                  | if (.steps | length) == 0 then "unstarted" else "started" end' > ended.txt
+          if [ -s ended.txt ] && ! grep -qvx unstarted ended.txt; then
+            gh run rerun "$RUN_ID" --failed
+          else
+            echo 'a stress job ran and failed; the report job has filed it'
+          fi
